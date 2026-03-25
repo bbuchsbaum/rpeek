@@ -19,6 +19,35 @@ Installed R packages are awkward to inspect programmatically:
 
 The helper process requires the R package `jsonlite` for robust request/response encoding.
 
+## Install
+
+Fastest install if you already have Rust and R:
+
+```bash
+Rscript -e 'install.packages("jsonlite")'
+cargo install --git https://github.com/bbuchsbaum/rpeek.git
+```
+
+Then verify it worked:
+
+```bash
+rpeek --help
+rpeek search-all lm
+```
+
+If you already cloned this repo:
+
+```bash
+Rscript -e 'install.packages("jsonlite")'
+cargo install --path .
+```
+
+Requirements:
+
+- `R` must be on your `PATH`
+- the R package `jsonlite` must be installed
+- `cargo` must be available if you are installing from source
+
 ## What It Can Do
 
 - package metadata and install location
@@ -38,13 +67,21 @@ The helper process requires the R package `jsonlite` for robust request/response
 
 ## Quick Start
 
-Build:
+If you installed with `cargo install`, run commands directly:
+
+```bash
+rpeek search rMVPA feature
+rpeek search-all feature_rsa_design
+rpeek summary rMVPA feature_rsa_design
+```
+
+If you are working from a local clone, build first:
 
 ```bash
 cargo build
 ```
 
-Run a few common commands:
+Then run a few common commands:
 
 ```bash
 cargo run -- search rMVPA feature
