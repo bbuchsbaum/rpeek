@@ -140,6 +140,37 @@ fn search_kind_and_limit_work() {
 }
 
 #[test]
+fn search_all_handles_quoted_query() {
+    let (code, stdout) = run(&["search-all", "--limit", "5", "\"lm\""]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(value["command"], "search_all");
+    assert_eq!(value["payload"]["query"], "\"lm\"");
+    assert!(value["payload"]["matches"].is_array());
+}
+
+#[test]
+fn search_all_finds_stats_lm() {
+    let (code, stdout) = run(&["search-all", "--kind", "object", "--limit", "10", "lm"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(value["command"], "search_all");
+    let matches = value["payload"]["matches"]
+        .as_array()
+        .expect("missing matches");
+    assert!(!matches.is_empty());
+    assert!(matches.len() <= 10);
+    assert!(matches.iter().all(|entry| entry["kind"] == "object"));
+    assert!(
+        matches
+            .iter()
+            .any(|entry| entry["package"] == "stats" && entry["name"] == "lm")
+    );
+}
+
+#[test]
 fn summary_returns_combined_payload() {
     let (code, stdout) = run(&["summary", "stats", "lm"]);
     assert_eq!(code, 0, "stdout: {stdout}");
@@ -154,13 +185,48 @@ fn summary_returns_combined_payload() {
 #[test]
 fn missing_object_returns_suggestions() {
     let (code, stdout) = run(&["sig", "stats", "lmx"]);
-    assert_eq!(code, 0, "stdout: {stdout}");
+    assert_eq!(code, 2, "stdout: {stdout}");
 
     let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
     assert_eq!(value["ok"], false);
     assert_eq!(value["error"]["code"], "object_not_found");
     assert!(value["error"]["suggestions"].is_array());
     assert!(value["error"]["hint"].as_str().is_some());
+}
+
+#[test]
+fn batch_returns_nonzero_when_any_item_fails() {
+    let tempdir = TempDir::new().expect("failed to create tempdir");
+    let socket = tempdir.path().join("rpeek-batch-error.sock");
+    let batch_file = tempdir.path().join("requests.jsonl");
+    fs::write(
+        &batch_file,
+        concat!(
+            r#"{"action":"summary","package":"stats","name":"lm"}"#,
+            "\n",
+            r#"{"action":"sig","package":"stats","name":"lmx"}"#,
+            "\n"
+        ),
+    )
+    .expect("failed to write batch file");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rpeek"))
+        .args(["batch", "--file", batch_file.to_str().expect("utf8 path")])
+        .env("RPEEK_SOCKET", &socket)
+        .output()
+        .expect("failed to run rpeek batch");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout not utf8");
+    assert_eq!(output.status.code().unwrap_or(-1), 2, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    let responses = value["payload"]["responses"]
+        .as_array()
+        .expect("missing responses");
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0]["ok"], true);
+    assert_eq!(responses[1]["ok"], false);
+    assert_eq!(responses[1]["error"]["code"], "object_not_found");
 }
 
 #[test]

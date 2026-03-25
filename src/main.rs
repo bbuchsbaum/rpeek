@@ -10,7 +10,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -22,6 +22,7 @@ const AFTER_HELP: &str = "\
 Examples:
   rpeek search dplyr mutate
   rpeek search --kind topic --limit 5 stats lm
+  rpeek search-all lm
   rpeek summary dplyr mutate
   rpeek source dplyr mutate
   rpeek doc dplyr mutate
@@ -51,6 +52,17 @@ enum Commands {
     #[command(about = "Search objects and help topics by substring")]
     Search {
         package: String,
+        query: String,
+        #[arg(long, value_enum, default_value_t = SearchKind::All)]
+        kind: SearchKind,
+        #[arg(long, default_value_t = 25)]
+        limit: usize,
+    },
+    #[command(
+        visible_alias = "searchall",
+        about = "Search exported symbols and help topics across installed packages"
+    )]
+    SearchAll {
         query: String,
         #[arg(long, value_enum, default_value_t = SearchKind::All)]
         kind: SearchKind,
@@ -113,6 +125,7 @@ impl SearchKind {
 #[derive(Clone, Debug, Serialize, Deserialize, Hash, Eq, PartialEq)]
 struct Request {
     action: String,
+    #[serde(default)]
     package: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
@@ -129,8 +142,9 @@ struct Request {
 fn main() {
     let exit_code = match run() {
         Ok(value) => {
+            let exit_code = response_exit_code(&value);
             println!("{value}");
-            0
+            exit_code
         }
         Err(err) => {
             let error = json!({
@@ -207,6 +221,15 @@ fn request_from_command(command: Commands) -> Result<Request> {
         } => Request {
             action: "search".to_string(),
             package,
+            name: None,
+            query: Some(query),
+            kind: Some(kind.as_request_value().to_string()),
+            limit: Some(limit.to_string()),
+            topic: None,
+        },
+        Commands::SearchAll { query, kind, limit } => Request {
+            action: "search_all".to_string(),
+            package: String::new(),
             name: None,
             query: Some(query),
             kind: Some(kind.as_request_value().to_string()),
@@ -498,7 +521,7 @@ fn handle_query_request(
     cache: &mut ResponseCache,
     socket: &Path,
 ) -> Result<String> {
-    if request.package.is_empty() {
+    if request.package.is_empty() && request.action != "search_all" {
         bail!("request is missing package");
     }
 
@@ -543,6 +566,7 @@ struct HelperProcess {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    stderr: BufReader<ChildStderr>,
     script_path: PathBuf,
 }
 
@@ -559,7 +583,7 @@ impl HelperProcess {
             .arg(&script_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .context("failed to start R helper process")?;
 
@@ -571,11 +595,16 @@ impl HelperProcess {
             .stdout
             .take()
             .ok_or_else(|| anyhow!("failed to open stdout for R helper"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow!("failed to open stderr for R helper"))?;
 
         let mut helper = Self {
             child,
             stdin,
             stdout: BufReader::new(stdout),
+            stderr: BufReader::new(stderr),
             script_path,
         };
         let ping = serde_json::to_string(&Request {
@@ -607,10 +636,26 @@ impl HelperProcess {
         let mut response = String::new();
         let count = self.stdout.read_line(&mut response)?;
         if count == 0 {
+            if let Some(status) = self.child.try_wait()? {
+                let stderr = self.read_stderr();
+                if stderr.is_empty() {
+                    bail!("R helper exited before replying with status {status}");
+                }
+                bail!(
+                    "R helper exited before replying with status {status}: {}",
+                    stderr.trim()
+                );
+            }
             bail!("R helper exited before replying");
         }
 
         Ok(response.trim().to_string())
+    }
+
+    fn read_stderr(&mut self) -> String {
+        let mut stderr = String::new();
+        let _ = self.stderr.read_to_string(&mut stderr);
+        stderr
     }
 }
 
@@ -679,6 +724,10 @@ fn agent_response() -> Value {
                     "command": "rpeek search --kind topic --limit 5 <package> <query>"
                 },
                 {
+                    "task": "Find a symbol when you do not know the package",
+                    "command": "rpeek search-all <query>"
+                },
+                {
                     "task": "Get one-call object summary",
                     "command": "rpeek summary <package> <object>"
                 },
@@ -699,6 +748,7 @@ fn agent_response() -> Value {
                 "JSON is the default output format.",
                 "Use RPEEK_SOCKET=/tmp/<name>.sock to reuse one warm daemon across calls.",
                 "Source kind can be raw_file, deparsed, or unavailable.",
+                "Use search-all for exported symbols and help topics when the package is unknown.",
                 "Batch input is JSON Lines matching the request schema."
             ]
         }
@@ -756,6 +806,31 @@ fn batch_item_error(index: usize, message: String) -> Value {
             "message": message,
         }
     })
+}
+
+fn response_exit_code(value: &Value) -> i32 {
+    if !response_reports_success(value) {
+        return 2;
+    }
+
+    if let Some(responses) = value
+        .get("payload")
+        .and_then(|payload| payload.get("responses"))
+        .and_then(Value::as_array)
+    {
+        if responses
+            .iter()
+            .any(|response| !response_reports_success(response))
+        {
+            return 2;
+        }
+    }
+
+    0
+}
+
+fn response_reports_success(value: &Value) -> bool {
+    value.get("ok").and_then(Value::as_bool).unwrap_or(false)
 }
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
@@ -935,7 +1010,7 @@ impl Request {
     fn is_cacheable(&self) -> bool {
         !matches!(
             self.action.as_str(),
-            "ping" | "cache_clear" | "cache_stats" | "fingerprint"
+            "ping" | "cache_clear" | "cache_stats" | "fingerprint" | "search_all"
         )
     }
 }

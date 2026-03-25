@@ -4,74 +4,18 @@ options(
   keep.source.pkgs = TRUE
 )
 
+if (!requireNamespace("jsonlite", quietly = TRUE)) {
+  stop(
+    "rpeek requires the 'jsonlite' package for helper protocol support. Install it with install.packages('jsonlite').",
+    call. = FALSE
+  )
+}
+
+rpeek_state <- new.env(parent = emptyenv())
+rpeek_state$search_index <- new.env(parent = emptyenv())
+
 `%||%` <- function(x, y) {
   if (is.null(x) || length(x) == 0) y else x
-}
-
-json_escape <- function(x) {
-  x <- enc2utf8(as.character(x))
-  x <- gsub("\\\\", "\\\\\\\\", x, perl = TRUE)
-  x <- gsub("\"", "\\\\\"", x, perl = TRUE)
-  x <- gsub("\b", "\\\\b", x, perl = TRUE)
-  x <- gsub("\f", "\\\\f", x, perl = TRUE)
-  x <- gsub("\n", "\\\\n", x, perl = TRUE)
-  x <- gsub("\r", "\\\\r", x, perl = TRUE)
-  x <- gsub("\t", "\\\\t", x, perl = TRUE)
-  x
-}
-
-to_json <- function(x) {
-  if (is.null(x)) {
-    return("null")
-  }
-
-  if (isTRUE(x)) {
-    return("true")
-  }
-
-  if (identical(x, FALSE)) {
-    return("false")
-  }
-
-  if (is.atomic(x) && length(x) == 1 && !is.character(x)) {
-    if (is.na(x)) {
-      return("null")
-    }
-    return(as.character(x))
-  }
-
-  if (is.character(x) && length(x) == 1) {
-    if (is.na(x)) {
-      return("null")
-    }
-    return(sprintf("\"%s\"", json_escape(x)))
-  }
-
-  if (is.atomic(x) && is.null(names(x))) {
-    values <- vapply(
-      as.list(x),
-      to_json,
-      character(1),
-      USE.NAMES = FALSE
-    )
-    return(sprintf("[%s]", paste(values, collapse = ",")))
-  }
-
-  if (is.list(x) && is.null(names(x))) {
-    values <- vapply(x, to_json, character(1), USE.NAMES = FALSE)
-    return(sprintf("[%s]", paste(values, collapse = ",")))
-  }
-
-  if (!is.null(names(x))) {
-    items <- Map(
-      function(name, value) sprintf("\"%s\":%s", json_escape(name), to_json(value)),
-      names(x),
-      as.list(x)
-    )
-    return(sprintf("{%s}", paste(items, collapse = ",")))
-  }
-
-  sprintf("\"%s\"", json_escape(paste(capture.output(str(x)), collapse = "\n")))
 }
 
 decode_request <- function(line) {
@@ -81,85 +25,23 @@ decode_request <- function(line) {
     stop("empty request")
   }
 
-  parse_string <- function(pos) {
-    if (substr(line, pos, pos) != "\"") {
-      stop("expected string")
-    }
-    pos <- pos + 1
-    buf <- character()
-    while (pos <= nchar(line)) {
-      ch <- substr(line, pos, pos)
-      if (ch == "\"") {
-        return(list(value = paste(buf, collapse = ""), pos = pos + 1))
-      }
-      if (ch == "\\") {
-        pos <- pos + 1
-        esc <- substr(line, pos, pos)
-        mapped <- switch(
-          esc,
-          "\"" = "\"",
-          "\\" = "\\",
-          "/" = "/",
-          "b" = "\b",
-          "f" = "\f",
-          "n" = "\n",
-          "r" = "\r",
-          "t" = "\t",
-          stop("unsupported escape")
-        )
-        buf <- c(buf, mapped)
-        pos <- pos + 1
-      } else {
-        buf <- c(buf, ch)
-        pos <- pos + 1
-      }
-    }
-    stop("unterminated string")
+  req <- jsonlite::fromJSON(line, simplifyVector = FALSE)
+  if (!is.list(req)) {
+    stop("request must decode to an object")
   }
 
-  pos <- 1
-  expect <- function(token) {
-    if (substr(line, pos, pos + nchar(token) - 1) != token) {
-      stop(sprintf("expected '%s'", token))
-    }
-    pos <<- pos + nchar(token)
-  }
-  skip_ws <- function() {
-    while (pos <= nchar(line) && grepl("\\s", substr(line, pos, pos))) {
-      pos <<- pos + 1
-    }
-  }
+  req
+}
 
-  skip_ws()
-  expect("{")
-  skip_ws()
-  out <- list()
-  repeat {
-    parsed_key <- parse_string(pos)
-    key <- parsed_key$value
-    pos <- parsed_key$pos
-    skip_ws()
-    expect(":")
-    skip_ws()
-    if (substr(line, pos, pos + 3) == "null") {
-      value <- NULL
-      pos <- pos + 4
-    } else {
-      parsed_val <- parse_string(pos)
-      value <- parsed_val$value
-      pos <- parsed_val$pos
-    }
-    out[[key]] <- value
-    skip_ws()
-    ch <- substr(line, pos, pos)
-    if (ch == "}") {
-      pos <- pos + 1
-      break
-    }
-    expect(",")
-    skip_ws()
-  }
-  out
+to_json <- function(x) {
+  jsonlite::toJSON(
+    x,
+    auto_unbox = TRUE,
+    null = "null",
+    na = "null",
+    POSIXt = "ISO8601",
+    digits = NA
+  )
 }
 
 normalize_package <- function(package) {
@@ -195,6 +77,53 @@ package_alias_map <- function(package) {
 
 all_object_names <- function(package) {
   sort(ls(asNamespace(package), all.names = TRUE))
+}
+
+installed_package_info <- function() {
+  info <- utils::installed.packages()[, c("Package", "LibPath"), drop = FALSE]
+  info <- info[order(info[, "Package"]), , drop = FALSE]
+  rownames(info) <- NULL
+  info
+}
+
+read_package_alias_map <- function(install_path) {
+  alias_path <- file.path(install_path, "help", "aliases.rds")
+  if (!file.exists(alias_path)) {
+    return(setNames(character(), character()))
+  }
+  tryCatch(readRDS(alias_path), error = function(...) setNames(character(), character()))
+}
+
+read_namespace_exports <- function(install_path) {
+  nsinfo_path <- file.path(install_path, "Meta", "nsInfo.rds")
+  if (!file.exists(nsinfo_path)) {
+    return(character())
+  }
+
+  nsinfo <- tryCatch(readRDS(nsinfo_path), error = function(...) NULL)
+  exports <- nsinfo[["exports"]]
+  if (is.null(exports)) {
+    return(character())
+  }
+
+  sort(unique(as.character(exports)))
+}
+
+package_search_index <- function(package, install_path) {
+  key <- normalizePath(install_path, winslash = "/", mustWork = FALSE)
+  if (exists(key, envir = rpeek_state$search_index, inherits = FALSE)) {
+    return(get(key, envir = rpeek_state$search_index, inherits = FALSE))
+  }
+
+  alias_map <- read_package_alias_map(install_path)
+  index <- list(
+    package = package,
+    install_path = install_path,
+    exports = read_namespace_exports(install_path),
+    topics = sort(unique(c(names(alias_map), unname(alias_map))))
+  )
+  assign(key, index, envir = rpeek_state$search_index)
+  index
 }
 
 rank_candidates <- function(candidates, query) {
@@ -463,6 +392,129 @@ search_matches <- function(candidates, query, limit, builder) {
   )
 }
 
+record_label <- function(record) {
+  record[["name"]] %||% record[["topic"]] %||% ""
+}
+
+rank_record_indices <- function(records, query) {
+  if (!length(records)) {
+    return(integer())
+  }
+
+  labels <- vapply(records, record_label, character(1), USE.NAMES = FALSE)
+  lowered <- tolower(labels)
+  query_lower <- tolower(query)
+  exact <- lowered == query_lower
+  prefix <- startsWith(lowered, query_lower)
+  contains <- grepl(query_lower, lowered, fixed = TRUE)
+  distances <- as.integer(utils::adist(query_lower, lowered, partial = TRUE))
+  packages <- vapply(records, function(record) record[["package"]] %||% "", character(1), USE.NAMES = FALSE)
+
+  order(!exact, !prefix, !contains, distances, nchar(labels), packages, labels)
+}
+
+search_record_matches <- function(records, query, limit) {
+  if (!length(records)) {
+    return(list(matches = list(), total = 0, matched_by = "none"))
+  }
+
+  labels <- vapply(records, record_label, character(1), USE.NAMES = FALSE)
+  lowered <- tolower(labels)
+  query_lower <- tolower(query)
+  substring_idx <- which(grepl(query_lower, lowered, fixed = TRUE))
+  matched_by <- "substring"
+  pool <- substring_idx
+
+  if (!length(pool)) {
+    matched_by <- "fuzzy"
+    ordered <- rank_record_indices(records, query)
+    pool <- head(ordered, max(limit * 3, limit))
+  }
+
+  if (!length(pool)) {
+    return(list(matches = list(), total = 0, matched_by = matched_by))
+  }
+
+  pool_records <- records[pool]
+  ranked <- pool_records[rank_record_indices(pool_records, query)]
+  list(
+    matches = unname(head(ranked, limit)),
+    total = length(pool_records),
+    matched_by = matched_by
+  )
+}
+
+search_all_packages <- function(query, kind = "all", limit = 25) {
+  kind <- match.arg(kind, c("all", "object", "topic"))
+  limit <- suppressWarnings(as.integer(limit))
+  if (is.na(limit) || limit < 1) {
+    limit <- 25
+  }
+  limit <- min(limit, 100)
+
+  package_info <- installed_package_info()
+  object_records <- list()
+  topic_records <- list()
+
+  for (i in seq_len(nrow(package_info))) {
+    package <- package_info[i, "Package"]
+    install_path <- file.path(package_info[i, "LibPath"], package)
+    index <- tryCatch(package_search_index(package, install_path), error = function(...) NULL)
+    if (is.null(index)) {
+      next
+    }
+
+    if (kind %in% c("all", "object") && length(index$exports)) {
+      object_records <- c(object_records, lapply(index$exports, function(name) {
+        list(
+          kind = "object",
+          package = package,
+          name = name,
+          exported = TRUE
+        )
+      }))
+    }
+
+    if (kind %in% c("all", "topic") && length(index$topics)) {
+      topic_records <- c(topic_records, lapply(index$topics, function(topic) {
+        list(
+          kind = "topic",
+          package = package,
+          topic = topic
+        )
+      }))
+    }
+  }
+
+  object_results <- search_record_matches(object_records, query, limit)
+  topic_results <- search_record_matches(topic_records, query, limit)
+  matches <- c(object_results$matches, topic_results$matches)
+  if (length(matches)) {
+    matches <- unname(matches[rank_record_indices(matches, query)])
+    matches <- head(matches, limit)
+  }
+
+  matched_packages <- if (length(matches)) {
+    length(unique(vapply(matches, function(record) record[["package"]], character(1), USE.NAMES = FALSE)))
+  } else {
+    0
+  }
+
+  list(
+    query = query,
+    kind = kind,
+    limit = limit,
+    scope = "installed_packages",
+    matches = matches,
+    counts = list(
+      packages = nrow(package_info),
+      objects = object_results$total,
+      topics = topic_results$total,
+      matched_packages = matched_packages
+    )
+  )
+}
+
 search_package <- function(package, query, kind = "all", limit = 25) {
   normalize_package(package)
   kind <- match.arg(kind, c("all", "object", "topic"))
@@ -561,6 +613,7 @@ dispatch <- function(req) {
     "exports" = list(package = package, exports = list_objects(package, TRUE)),
     "objects" = list(package = package, objects = list_objects(package, FALSE)),
     "search" = search_package(package, query, kind = kind, limit = limit),
+    "search_all" = search_all_packages(query, kind = kind, limit = limit),
     "summary" = summary_for_object(package, name),
     "sig" = object_info(package, name),
     "source" = best_effort_source(package, name),

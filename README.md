@@ -17,12 +17,15 @@ Installed R packages are awkward to inspect programmatically:
 
 `rpeek` keeps a warm daemon alive behind the CLI and exposes the common introspection tasks directly.
 
+The helper process requires the R package `jsonlite` for robust request/response encoding.
+
 ## What It Can Do
 
 - package metadata and install location
 - exported symbols
 - full namespace object listing
 - substring search across objects and help topics
+- cross-package search across installed package exports and help topics
 - search filtering by result kind and limit
 - one-call object summaries
 - function signatures
@@ -45,6 +48,7 @@ Run a few common commands:
 
 ```bash
 cargo run -- search rMVPA feature
+cargo run -- search-all feature_rsa_design
 cargo run -- summary rMVPA feature_rsa_design
 cargo run -- source rMVPA feature_rsa_design
 cargo run -- doc rMVPA feature_rsa_design
@@ -64,6 +68,12 @@ Find likely symbols when you only know part of a name:
 
 ```bash
 cargo run -- search --kind object --limit 10 stats lm
+```
+
+Find a symbol when you do not know the package:
+
+```bash
+cargo run -- search-all --kind object --limit 10 lm
 ```
 
 Get one compact summary payload:
@@ -116,7 +126,7 @@ Typical response shape:
 }
 ```
 
-Errors are also structured and may include suggestions and a next-step hint:
+Errors are also structured and may include suggestions and a next-step hint. Request-level failures exit with status `2`; client/runtime failures exit with status `1`.
 
 ```json
 {
@@ -171,9 +181,11 @@ Useful manual checks:
 
 ```bash
 cargo run -- search stats lm
+cargo run -- search-all lm
 cargo run -- search --kind topic --limit 5 stats lm
 cargo run -- summary stats lm
 cargo run -- source stats lm
 cargo run -- doc stats lm
 cargo run -- sig stats lmx
+echo $?
 ```
