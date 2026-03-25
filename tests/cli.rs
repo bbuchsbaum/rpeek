@@ -1,0 +1,149 @@
+use std::path::Path;
+use std::process::Command;
+use tempfile::TempDir;
+
+fn run(args: &[&str]) -> (i32, String) {
+    let tempdir = TempDir::new().expect("failed to create tempdir");
+    let socket = tempdir.path().join("rpkg-test.sock");
+    run_with_socket(&socket, args)
+}
+
+fn run_with_socket(socket: &Path, args: &[&str]) -> (i32, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_rpkg"))
+        .args(args)
+        .env("RPKG_SOCKET", &socket)
+        .output()
+        .expect("failed to run rpkg");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout not utf8");
+    (output.status.code().unwrap_or(-1), stdout)
+}
+
+#[test]
+fn pkg_returns_metadata() {
+    let (code, stdout) = run(&["pkg", "utils"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["payload"]["package"], "utils");
+    assert!(value["payload"]["version"].is_string());
+}
+
+#[test]
+fn sig_returns_formals() {
+    let (code, stdout) = run(&["sig", "stats", "lm"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    let signature = value["payload"]["signature"]
+        .as_str()
+        .expect("missing signature");
+    assert!(signature.contains("function (formula, data, subset"));
+}
+
+#[test]
+fn source_returns_kind_and_text() {
+    let (code, stdout) = run(&["source", "stats", "lm"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(value["payload"]["kind"], "deparsed");
+    let text = value["payload"]["text"].as_str().expect("missing text");
+    assert!(text.contains("ret.x <- x"));
+}
+
+#[test]
+fn doc_returns_usage() {
+    let (code, stdout) = run(&["doc", "stats", "lm"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(value["payload"]["topic"], "lm");
+    assert!(value["payload"]["usage"].as_str().is_some());
+}
+
+#[test]
+fn cache_stats_and_clear_work() {
+    let tempdir = TempDir::new().expect("failed to create tempdir");
+    let socket = tempdir.path().join("rpkg-cache.sock");
+
+    let (code, stdout) = run_with_socket(&socket, &["cache", "stats"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let stats: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(stats["payload"]["entries"], 0);
+    assert_eq!(stats["payload"]["hits"], 0);
+    assert_eq!(stats["payload"]["misses"], 0);
+
+    let (code, stdout) = run_with_socket(&socket, &["sig", "stats", "lm"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(value["payload"]["name"], "lm");
+
+    let (code, stdout) = run_with_socket(&socket, &["cache", "stats"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let stats: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(stats["payload"]["entries"], 1);
+    assert_eq!(stats["payload"]["packages"], 1);
+    assert_eq!(stats["payload"]["hits"], 0);
+    assert_eq!(stats["payload"]["misses"], 1);
+
+    let (code, stdout) = run_with_socket(&socket, &["sig", "stats", "lm"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let (code, stdout) = run_with_socket(&socket, &["cache", "stats"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let stats: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(stats["payload"]["entries"], 1);
+    assert_eq!(stats["payload"]["hits"], 1);
+    assert_eq!(stats["payload"]["misses"], 1);
+
+    let (code, stdout) = run_with_socket(&socket, &["cache", "clear"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let cleared: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(cleared["payload"]["cleared_entries"], 1);
+    assert_eq!(cleared["payload"]["cleared_packages"], 1);
+
+    let (code, stdout) = run_with_socket(&socket, &["cache", "stats"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let stats: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(stats["payload"]["entries"], 0);
+    assert_eq!(stats["payload"]["packages"], 0);
+}
+
+#[test]
+fn search_returns_matches() {
+    let (code, stdout) = run(&["search", "stats", "lm"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(value["command"], "search");
+    let matches = value["payload"]["matches"]
+        .as_array()
+        .expect("missing matches");
+    assert!(!matches.is_empty());
+}
+
+#[test]
+fn summary_returns_combined_payload() {
+    let (code, stdout) = run(&["summary", "stats", "lm"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(value["command"], "summary");
+    assert_eq!(value["payload"]["object"]["name"], "lm");
+    assert_eq!(value["payload"]["source"]["kind"], "deparsed");
+    assert!(value["payload"]["doc"]["title"].as_str().is_some());
+}
+
+#[test]
+fn missing_object_returns_suggestions() {
+    let (code, stdout) = run(&["sig", "stats", "lmx"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["code"], "object_not_found");
+    assert!(value["error"]["suggestions"].is_array());
+    assert!(value["error"]["hint"].as_str().is_some());
+}
