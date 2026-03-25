@@ -197,7 +197,7 @@ all_object_names <- function(package) {
   sort(ls(asNamespace(package), all.names = TRUE))
 }
 
-candidate_suggestions <- function(candidates, query, limit = 5) {
+rank_candidates <- function(candidates, query) {
   candidates <- unique(candidates[nzchar(candidates)])
   if (!length(candidates)) {
     return(character())
@@ -205,14 +205,15 @@ candidate_suggestions <- function(candidates, query, limit = 5) {
 
   lowered <- tolower(candidates)
   query_lower <- tolower(query)
-  contains <- candidates[grepl(query_lower, lowered, fixed = TRUE)]
-  if (length(contains)) {
-    return(head(contains, limit))
-  }
+  exact <- lowered == query_lower
+  prefix <- startsWith(lowered, query_lower)
+  contains <- grepl(query_lower, lowered, fixed = TRUE)
+  distances <- as.integer(utils::adist(query_lower, lowered, partial = TRUE))
+  candidates[order(!exact, !prefix, !contains, distances, nchar(candidates), candidates)]
+}
 
-  distances <- utils::adist(query_lower, lowered, partial = TRUE)
-  ordered <- candidates[order(distances, nchar(candidates), candidates)]
-  head(ordered, limit)
+candidate_suggestions <- function(candidates, query, limit = 5) {
+  head(rank_candidates(candidates, query), limit)
 }
 
 object_suggestions <- function(package, name) {
@@ -255,7 +256,7 @@ lookup_object <- function(package, name) {
       "object_not_found",
       sprintf("object '%s' not found in package '%s'", name, package),
       suggestions = suggestions,
-      hint = sprintf("Try `rpkg search %s %s`.", package, name)
+      hint = sprintf("Try `rpeek search %s %s`.", package, name)
     )
   }
   obj <- get(name, envir = ns, inherits = FALSE)
@@ -323,7 +324,7 @@ extract_help_topic <- function(package, topic) {
       "topic_not_found",
       sprintf("help topic '%s' not found in package '%s'", topic, package),
       suggestions = suggestions,
-      hint = sprintf("Try `rpkg search %s %s`.", package, topic)
+      hint = sprintf("Try `rpeek search %s %s`.", package, topic)
     )
   }
 
@@ -437,38 +438,77 @@ help_topic_summary <- function(package, topic) {
   )
 }
 
-search_package <- function(package, query) {
+search_matches <- function(candidates, query, limit, builder) {
+  candidates <- unique(candidates[nzchar(candidates)])
+  if (!length(candidates)) {
+    return(list(matches = list(), total = 0, matched_by = "none"))
+  }
+
+  lowered <- tolower(candidates)
+  query_lower <- tolower(query)
+  substring_matches <- candidates[grepl(query_lower, lowered, fixed = TRUE)]
+  matched_by <- "substring"
+  pool <- substring_matches
+
+  if (!length(pool)) {
+    matched_by <- "fuzzy"
+    pool <- head(rank_candidates(candidates, query), max(limit * 3, limit))
+  }
+
+  ranked <- head(rank_candidates(pool, query), limit)
+  list(
+    matches = lapply(ranked, function(item) builder(item, matched_by)),
+    total = length(pool),
+    matched_by = matched_by
+  )
+}
+
+search_package <- function(package, query, kind = "all", limit = 25) {
   normalize_package(package)
+  kind <- match.arg(kind, c("all", "object", "topic"))
+  limit <- suppressWarnings(as.integer(limit))
+  if (is.na(limit) || limit < 1) {
+    limit <- 25
+  }
+  limit <- min(limit, 100)
+
   objects <- all_object_names(package)
   alias_map <- package_alias_map(package)
-  query_lower <- tolower(query)
+  topics <- unique(c(names(alias_map), unname(alias_map)))
 
-  object_matches <- objects[grepl(query_lower, tolower(objects), fixed = TRUE)]
-  alias_name_matches <- names(alias_map)[grepl(query_lower, tolower(names(alias_map)), fixed = TRUE)]
-  alias_topic_matches <- unname(alias_map)[grepl(query_lower, tolower(unname(alias_map)), fixed = TRUE)]
-  topics <- unique(c(alias_name_matches, alias_topic_matches))
+  object_results <- list(matches = list(), total = 0, matched_by = "none")
+  topic_results <- list(matches = list(), total = 0, matched_by = "none")
 
-  object_results <- lapply(head(object_matches, 25), function(name) {
-    list(
-      kind = "object",
-      name = name,
-      exported = name %in% getNamespaceExports(package)
-    )
-  })
-  topic_results <- lapply(head(topics, 25), function(topic) {
-    list(
-      kind = "topic",
-      topic = topic
-    )
-  })
+  if (kind %in% c("all", "object")) {
+    object_results <- search_matches(objects, query, limit, function(name, matched_by) {
+      list(
+        kind = "object",
+        name = name,
+        exported = name %in% getNamespaceExports(package),
+        matched_by = matched_by
+      )
+    })
+  }
+
+  if (kind %in% c("all", "topic")) {
+    topic_results <- search_matches(topics, query, limit, function(topic, matched_by) {
+      list(
+        kind = "topic",
+        topic = topic,
+        matched_by = matched_by
+      )
+    })
+  }
 
   list(
     package = package,
     query = query,
-    matches = c(object_results, topic_results),
+    kind = kind,
+    limit = limit,
+    matches = c(object_results$matches, topic_results$matches),
     counts = list(
-      objects = length(object_matches),
-      topics = length(topics)
+      objects = object_results$total,
+      topics = topic_results$total
     )
   )
 }
@@ -505,6 +545,8 @@ dispatch <- function(req) {
   package <- req[["package"]]
   name <- req[["name"]]
   query <- req[["query"]]
+  kind <- req[["kind"]] %||% "all"
+  limit <- req[["limit"]] %||% "25"
   topic <- req[["topic"]]
 
   payload <- switch(
@@ -518,7 +560,7 @@ dispatch <- function(req) {
     "pkg" = package_description(package),
     "exports" = list(package = package, exports = list_objects(package, TRUE)),
     "objects" = list(package = package, objects = list_objects(package, FALSE)),
-    "search" = search_package(package, query),
+    "search" = search_package(package, query, kind = kind, limit = limit),
     "summary" = summary_for_object(package, name),
     "sig" = object_info(package, name),
     "source" = best_effort_source(package, name),

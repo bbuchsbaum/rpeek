@@ -1,19 +1,20 @@
+use std::fs;
 use std::path::Path;
 use std::process::Command;
 use tempfile::TempDir;
 
 fn run(args: &[&str]) -> (i32, String) {
     let tempdir = TempDir::new().expect("failed to create tempdir");
-    let socket = tempdir.path().join("rpkg-test.sock");
+    let socket = tempdir.path().join("rpeek-test.sock");
     run_with_socket(&socket, args)
 }
 
 fn run_with_socket(socket: &Path, args: &[&str]) -> (i32, String) {
-    let output = Command::new(env!("CARGO_BIN_EXE_rpkg"))
+    let output = Command::new(env!("CARGO_BIN_EXE_rpeek"))
         .args(args)
-        .env("RPKG_SOCKET", &socket)
+        .env("RPEEK_SOCKET", socket)
         .output()
-        .expect("failed to run rpkg");
+        .expect("failed to run rpeek");
 
     let stdout = String::from_utf8(output.stdout).expect("stdout not utf8");
     (output.status.code().unwrap_or(-1), stdout)
@@ -66,7 +67,7 @@ fn doc_returns_usage() {
 #[test]
 fn cache_stats_and_clear_work() {
     let tempdir = TempDir::new().expect("failed to create tempdir");
-    let socket = tempdir.path().join("rpkg-cache.sock");
+    let socket = tempdir.path().join("rpeek-cache.sock");
 
     let (code, stdout) = run_with_socket(&socket, &["cache", "stats"]);
     assert_eq!(code, 0, "stdout: {stdout}");
@@ -125,6 +126,20 @@ fn search_returns_matches() {
 }
 
 #[test]
+fn search_kind_and_limit_work() {
+    let (code, stdout) = run(&["search", "--kind", "topic", "--limit", "3", "stats", "lm"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    let matches = value["payload"]["matches"]
+        .as_array()
+        .expect("missing matches");
+    assert!(!matches.is_empty());
+    assert!(matches.len() <= 3);
+    assert!(matches.iter().all(|entry| entry["kind"] == "topic"));
+}
+
+#[test]
 fn summary_returns_combined_payload() {
     let (code, stdout) = run(&["summary", "stats", "lm"]);
     assert_eq!(code, 0, "stdout: {stdout}");
@@ -146,4 +161,38 @@ fn missing_object_returns_suggestions() {
     assert_eq!(value["error"]["code"], "object_not_found");
     assert!(value["error"]["suggestions"].is_array());
     assert!(value["error"]["hint"].as_str().is_some());
+}
+
+#[test]
+fn batch_returns_multiple_responses() {
+    let tempdir = TempDir::new().expect("failed to create tempdir");
+    let socket = tempdir.path().join("rpeek-batch.sock");
+    let batch_file = tempdir.path().join("requests.jsonl");
+    fs::write(
+        &batch_file,
+        concat!(
+            r#"{"action":"summary","package":"stats","name":"lm"}"#,
+            "\n",
+            r#"{"action":"sig","package":"stats","name":"lm"}"#,
+            "\n"
+        ),
+    )
+    .expect("failed to write batch file");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rpeek"))
+        .args(["batch", "--file", batch_file.to_str().expect("utf8 path")])
+        .env("RPEEK_SOCKET", &socket)
+        .output()
+        .expect("failed to run rpeek batch");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout not utf8");
+    assert_eq!(output.status.code().unwrap_or(-1), 0, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    let responses = value["payload"]["responses"]
+        .as_array()
+        .expect("missing responses");
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0]["command"], "summary");
+    assert_eq!(responses[1]["command"], "sig");
 }

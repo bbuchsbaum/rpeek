@@ -4,9 +4,7 @@ Fast installed-R-package introspection for coding agents.
 
 `rpeek` is a small Rust CLI for exploring installed R packages without writing throwaway `Rscript -e ...` probes. It is built for agent workflows: fast startup after the first call, JSON output by default, and commands that map directly to how an LLM explores code.
 
-Current binary name: `rpkg`
-
-That means local examples currently use `cargo run -- ...` or `target/debug/rpkg ...`. The repository can keep the `rpeek` project name even before the binary is renamed.
+Current binary name: `rpeek`
 
 ## Why This Exists
 
@@ -25,6 +23,7 @@ Installed R packages are awkward to inspect programmatically:
 - exported symbols
 - full namespace object listing
 - substring search across objects and help topics
+- search filtering by result kind and limit
 - one-call object summaries
 - function signatures
 - best-effort source retrieval
@@ -32,6 +31,7 @@ Installed R packages are awkward to inspect programmatically:
 - S3 and S4 method discovery
 - installed file listing
 - daemon-local caching with stats and reset commands
+- batch execution for multiple agent requests in one process
 
 ## Quick Start
 
@@ -54,8 +54,8 @@ cargo run -- exports rMVPA
 If you prefer the built binary:
 
 ```bash
-target/debug/rpkg search rMVPA feature
-target/debug/rpkg summary rMVPA feature_rsa_design
+target/debug/rpeek search rMVPA feature
+target/debug/rpeek summary rMVPA feature_rsa_design
 ```
 
 ## Agent-Friendly Workflows
@@ -63,7 +63,7 @@ target/debug/rpkg summary rMVPA feature_rsa_design
 Find likely symbols when you only know part of a name:
 
 ```bash
-cargo run -- search stats lm
+cargo run -- search --kind object --limit 10 stats lm
 ```
 
 Get one compact summary payload:
@@ -82,6 +82,15 @@ Read installed docs:
 
 ```bash
 cargo run -- doc stats lm
+```
+
+Run multiple requests in one process:
+
+```bash
+cat <<'EOF' | cargo run -- batch
+{"action":"summary","package":"stats","name":"lm"}
+{"action":"source","package":"stats","name":"lm"}
+EOF
 ```
 
 Get usage guidance from the tool itself:
@@ -138,16 +147,16 @@ For installed R packages, `deparsed` is often the expected case.
 The CLI uses a background daemon and caches successful responses in memory. To force multiple calls to reuse the same warm daemon, set a socket path explicitly:
 
 ```bash
-RPKG_SOCKET=/tmp/rpeek-demo.sock target/debug/rpkg cache clear
-RPKG_SOCKET=/tmp/rpeek-demo.sock target/debug/rpkg summary rMVPA feature_rsa_design
-RPKG_SOCKET=/tmp/rpeek-demo.sock target/debug/rpkg cache stats
+RPEEK_SOCKET=/tmp/rpeek-demo.sock target/debug/rpeek cache clear
+RPEEK_SOCKET=/tmp/rpeek-demo.sock target/debug/rpeek summary rMVPA feature_rsa_design
+RPEEK_SOCKET=/tmp/rpeek-demo.sock target/debug/rpeek cache stats
 ```
 
 Useful cache commands:
 
 ```bash
-target/debug/rpkg cache stats
-target/debug/rpkg cache clear
+target/debug/rpeek cache stats
+target/debug/rpeek cache clear
 ```
 
 ## Development
@@ -162,12 +171,9 @@ Useful manual checks:
 
 ```bash
 cargo run -- search stats lm
+cargo run -- search --kind topic --limit 5 stats lm
 cargo run -- summary stats lm
 cargo run -- source stats lm
 cargo run -- doc stats lm
 cargo run -- sig stats lmx
 ```
-
-## Current Status
-
-The core CLI is working and validated against both tests and real installed packages. The current repo name is `rpeek`, while the crate/binary is still `rpkg`. Renaming the binary is straightforward, but the GitHub-facing documentation can already use the `rpeek` project name.

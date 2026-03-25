@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -20,16 +20,17 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const HELPER_SCRIPT: &str = include_str!("r_helper.R");
 const AFTER_HELP: &str = "\
 Examples:
-  rpkg search dplyr mutate
-  rpkg summary dplyr mutate
-  rpkg source dplyr mutate
-  rpkg doc dplyr mutate
-  rpkg exports dplyr
-  rpkg agent";
+  rpeek search dplyr mutate
+  rpeek search --kind topic --limit 5 stats lm
+  rpeek summary dplyr mutate
+  rpeek source dplyr mutate
+  rpeek doc dplyr mutate
+  rpeek batch --file requests.jsonl
+  rpeek agent";
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "rpkg",
+    name = "rpeek",
     version,
     about = "Fast installed-R-package introspection for coding agents",
     after_help = AFTER_HELP
@@ -48,7 +49,14 @@ enum Commands {
     #[command(visible_alias = "ls", about = "All objects in the namespace")]
     Objects { package: String },
     #[command(about = "Search objects and help topics by substring")]
-    Search { package: String, query: String },
+    Search {
+        package: String,
+        query: String,
+        #[arg(long, value_enum, default_value_t = SearchKind::All)]
+        kind: SearchKind,
+        #[arg(long, default_value_t = 25)]
+        limit: usize,
+    },
     #[command(visible_aliases = ["show", "info"], about = "One-call object summary")]
     Summary { package: String, name: String },
     #[command(about = "Function signature or object metadata")]
@@ -63,6 +71,11 @@ enum Commands {
     Files { package: String },
     #[command(about = "Quick usage guide for agents and scripts")]
     Agent,
+    #[command(about = "Run multiple JSON requests from stdin or a file")]
+    Batch {
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
     Cache {
         #[command(subcommand)]
         command: CacheCommands,
@@ -80,6 +93,23 @@ enum CacheCommands {
     Stats,
 }
 
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum SearchKind {
+    All,
+    Object,
+    Topic,
+}
+
+impl SearchKind {
+    fn as_request_value(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Object => "object",
+            Self::Topic => "topic",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Hash, Eq, PartialEq)]
 struct Request {
     action: String,
@@ -88,6 +118,10 @@ struct Request {
     name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     query: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     topic: Option<String>,
 }
@@ -128,6 +162,7 @@ fn run() -> Result<Value> {
             }))
         }
         Commands::Agent => Ok(agent_response()),
+        Commands::Batch { file } => Ok(batch_response(file)?),
         command => {
             let request = request_from_command(command)?;
             query_daemon(&request)
@@ -142,6 +177,8 @@ fn request_from_command(command: Commands) -> Result<Request> {
             package,
             name: None,
             query: None,
+            kind: None,
+            limit: None,
             topic: None,
         },
         Commands::Exports { package } => Request {
@@ -149,6 +186,8 @@ fn request_from_command(command: Commands) -> Result<Request> {
             package,
             name: None,
             query: None,
+            kind: None,
+            limit: None,
             topic: None,
         },
         Commands::Objects { package } => Request {
@@ -156,13 +195,22 @@ fn request_from_command(command: Commands) -> Result<Request> {
             package,
             name: None,
             query: None,
+            kind: None,
+            limit: None,
             topic: None,
         },
-        Commands::Search { package, query } => Request {
+        Commands::Search {
+            package,
+            query,
+            kind,
+            limit,
+        } => Request {
             action: "search".to_string(),
             package,
             name: None,
             query: Some(query),
+            kind: Some(kind.as_request_value().to_string()),
+            limit: Some(limit.to_string()),
             topic: None,
         },
         Commands::Summary { package, name } => Request {
@@ -170,6 +218,8 @@ fn request_from_command(command: Commands) -> Result<Request> {
             package,
             name: Some(name),
             query: None,
+            kind: None,
+            limit: None,
             topic: None,
         },
         Commands::Sig { package, name } => Request {
@@ -177,6 +227,8 @@ fn request_from_command(command: Commands) -> Result<Request> {
             package,
             name: Some(name),
             query: None,
+            kind: None,
+            limit: None,
             topic: None,
         },
         Commands::Source { package, name } => Request {
@@ -184,6 +236,8 @@ fn request_from_command(command: Commands) -> Result<Request> {
             package,
             name: Some(name),
             query: None,
+            kind: None,
+            limit: None,
             topic: None,
         },
         Commands::Doc { package, topic } => Request {
@@ -191,6 +245,8 @@ fn request_from_command(command: Commands) -> Result<Request> {
             package,
             name: None,
             query: None,
+            kind: None,
+            limit: None,
             topic: Some(topic),
         },
         Commands::Methods { package, name } => Request {
@@ -198,6 +254,8 @@ fn request_from_command(command: Commands) -> Result<Request> {
             package,
             name: Some(name),
             query: None,
+            kind: None,
+            limit: None,
             topic: None,
         },
         Commands::Files { package } => Request {
@@ -205,6 +263,8 @@ fn request_from_command(command: Commands) -> Result<Request> {
             package,
             name: None,
             query: None,
+            kind: None,
+            limit: None,
             topic: None,
         },
         Commands::Cache { command } => match command {
@@ -213,6 +273,8 @@ fn request_from_command(command: Commands) -> Result<Request> {
                 package: String::new(),
                 name: None,
                 query: None,
+                kind: None,
+                limit: None,
                 topic: None,
             },
             CacheCommands::Stats => Request {
@@ -220,10 +282,13 @@ fn request_from_command(command: Commands) -> Result<Request> {
                 package: String::new(),
                 name: None,
                 query: None,
+                kind: None,
+                limit: None,
                 topic: None,
             },
         },
         Commands::Agent => bail!("agent is not a daemon command"),
+        Commands::Batch { .. } => bail!("batch is not a daemon command"),
         Commands::Serve { .. } => bail!("serve is not a client command"),
     };
 
@@ -280,7 +345,7 @@ fn ensure_daemon_running(socket: &Path) -> Result<()> {
                 Ok(())
             });
         }
-        command.spawn().context("failed to spawn rpkg daemon")?;
+        command.spawn().context("failed to spawn rpeek daemon")?;
     }
 
     let start = Instant::now();
@@ -314,6 +379,8 @@ fn daemon_is_healthy(socket: &Path) -> bool {
         package: String::new(),
         name: None,
         query: None,
+        kind: None,
+        limit: None,
         topic: None,
     });
     let Ok(ping) = ping else {
@@ -516,6 +583,8 @@ impl HelperProcess {
             package: String::new(),
             name: None,
             query: None,
+            kind: None,
+            limit: None,
             topic: None,
         })?;
         helper.send(&ping).context("R helper failed startup ping")?;
@@ -554,6 +623,9 @@ impl Drop for HelperProcess {
 }
 
 fn socket_path() -> PathBuf {
+    if let Ok(path) = env::var("RPEEK_SOCKET") {
+        return PathBuf::from(path);
+    }
     if let Ok(path) = env::var("RPKG_SOCKET") {
         return PathBuf::from(path);
     }
@@ -566,14 +638,14 @@ fn socket_path() -> PathBuf {
         .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| duration.as_secs().to_string())
         .unwrap_or_else(|| "dev".to_string());
-    env::temp_dir().join(format!("rpkg-{user}-{build_tag}.sock"))
+    env::temp_dir().join(format!("rpeek-{user}-{build_tag}.sock"))
 }
 
 fn helper_script_path(socket: &Path) -> PathBuf {
     let stem = socket
         .file_stem()
         .and_then(|value| value.to_str())
-        .unwrap_or("rpkg");
+        .unwrap_or("rpeek");
     socket.with_file_name(format!("{stem}-helper.R"))
 }
 
@@ -581,12 +653,14 @@ fn socket_lock_path(socket: &Path) -> PathBuf {
     let stem = socket
         .file_name()
         .and_then(|value| value.to_str())
-        .unwrap_or("rpkg.sock");
+        .unwrap_or("rpeek.sock");
     socket.with_file_name(format!("{stem}.lock"))
 }
 
 fn r_command() -> String {
-    env::var("RPKG_R_COMMAND").unwrap_or_else(|_| "R".to_string())
+    env::var("RPEEK_R_COMMAND")
+        .or_else(|_| env::var("RPKG_R_COMMAND"))
+        .unwrap_or_else(|_| "R".to_string())
 }
 
 fn agent_response() -> Value {
@@ -598,30 +672,88 @@ fn agent_response() -> Value {
             "workflows": [
                 {
                     "task": "Find likely symbols",
-                    "command": "rpkg search <package> <query>"
+                    "command": "rpeek search <package> <query>"
+                },
+                {
+                    "task": "Limit or filter search results",
+                    "command": "rpeek search --kind topic --limit 5 <package> <query>"
                 },
                 {
                     "task": "Get one-call object summary",
-                    "command": "rpkg summary <package> <object>"
+                    "command": "rpeek summary <package> <object>"
                 },
                 {
                     "task": "Read source",
-                    "command": "rpkg source <package> <object>"
+                    "command": "rpeek source <package> <object>"
                 },
                 {
                     "task": "Read docs",
-                    "command": "rpkg doc <package> <topic>"
+                    "command": "rpeek doc <package> <topic>"
                 },
                 {
-                    "task": "List exports",
-                    "command": "rpkg exports <package>"
+                    "task": "Run multiple requests",
+                    "command": "rpeek batch --file requests.jsonl"
                 }
             ],
             "notes": [
                 "JSON is the default output format.",
-                "Use RPKG_SOCKET=/tmp/<name>.sock to reuse one warm daemon across calls.",
-                "Source kind can be raw_file, deparsed, or unavailable."
+                "Use RPEEK_SOCKET=/tmp/<name>.sock to reuse one warm daemon across calls.",
+                "Source kind can be raw_file, deparsed, or unavailable.",
+                "Batch input is JSON Lines matching the request schema."
             ]
+        }
+    })
+}
+
+fn batch_response(file: Option<PathBuf>) -> Result<Value> {
+    let input = match file {
+        Some(path) => fs::read_to_string(&path)
+            .with_context(|| format!("failed to read batch file {}", path.display()))?,
+        None => {
+            let mut buffer = String::new();
+            std::io::stdin().read_to_string(&mut buffer)?;
+            buffer
+        }
+    };
+
+    let mut responses = Vec::new();
+    for (index, raw_line) in input.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        match serde_json::from_str::<Request>(line) {
+            Ok(request) => match query_daemon(&request) {
+                Ok(response) => responses.push(response),
+                Err(err) => responses.push(batch_item_error(index, err.to_string())),
+            },
+            Err(err) => responses.push(batch_item_error(
+                index,
+                format!("invalid batch request JSON: {err}"),
+            )),
+        }
+    }
+
+    Ok(json!({
+        "schema_version": 1,
+        "ok": true,
+        "command": "batch",
+        "payload": {
+            "responses": responses
+        }
+    }))
+}
+
+fn batch_item_error(index: usize, message: String) -> Value {
+    json!({
+        "schema_version": 1,
+        "ok": false,
+        "command": "batch_item",
+        "batch_index": index,
+        "error": {
+            "code": "batch_request_error",
+            "message": message,
         }
     })
 }
@@ -715,6 +847,8 @@ impl ResponseCache {
             package: package.to_string(),
             name: None,
             query: None,
+            kind: None,
+            limit: None,
             topic: None,
         };
         let fingerprint_line = serde_json::to_string(&fingerprint_request)?;
