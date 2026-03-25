@@ -21,32 +21,43 @@ The helper process requires the R package `jsonlite` for robust request/response
 
 ## Install
 
-Fastest install if you already have Rust and R:
+You need three things: **R**, the **Rust toolchain** (`cargo`), and the R package **jsonlite**.
+
+### 1. Prerequisites
+
+| Prerequisite | How to get it |
+|---|---|
+| **R** | [cran.r-project.org](https://cran.r-project.org/) or `brew install r` on macOS |
+| **Rust / cargo** | [rustup.rs](https://rustup.rs/) — one-liner: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
+| **jsonlite** (R package) | `Rscript -e 'install.packages("jsonlite")'` |
+
+### 2. Install rpeek
+
+From GitHub (recommended):
 
 ```bash
-Rscript -e 'install.packages("jsonlite")'
 cargo install --git https://github.com/bbuchsbaum/rpeek.git
 ```
 
-Then verify it worked:
+Or from a local clone:
 
 ```bash
-rpeek --help
-rpeek search-all lm
-```
-
-If you already cloned this repo:
-
-```bash
-Rscript -e 'install.packages("jsonlite")'
 cargo install --path .
 ```
 
-Requirements:
+### 3. Verify
 
-- `R` must be on your `PATH`
-- the R package `jsonlite` must be installed
-- `cargo` must be available if you are installing from source
+```bash
+rpeek doctor
+```
+
+This checks that R is on your PATH and jsonlite is installed. You should see `"ok": true` for every check. If something is missing, the output tells you exactly what to run.
+
+Then try it out:
+
+```bash
+rpeek search-all lm
+```
 
 ## What It Can Do
 

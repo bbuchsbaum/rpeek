@@ -83,6 +83,8 @@ enum Commands {
     Files { package: String },
     #[command(about = "Quick usage guide for agents and scripts")]
     Agent,
+    #[command(about = "Check prerequisites (R, jsonlite, etc.)")]
+    Doctor,
     #[command(about = "Run multiple JSON requests from stdin or a file")]
     Batch {
         #[arg(long)]
@@ -176,6 +178,7 @@ fn run() -> Result<Value> {
             }))
         }
         Commands::Agent => Ok(agent_response()),
+        Commands::Doctor => Ok(doctor_response()),
         Commands::Batch { file } => Ok(batch_response(file)?),
         command => {
             let request = request_from_command(command)?;
@@ -313,6 +316,7 @@ fn request_from_command(command: Commands) -> Result<Request> {
         Commands::Agent => bail!("agent is not a daemon command"),
         Commands::Batch { .. } => bail!("batch is not a daemon command"),
         Commands::Serve { .. } => bail!("serve is not a client command"),
+        Commands::Doctor => bail!("doctor is not a client command"),
     };
 
     Ok(request)
@@ -585,7 +589,17 @@ impl HelperProcess {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .context("failed to start R helper process")?;
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    anyhow!(
+                        "R not found. Install R from https://cran.r-project.org/ and ensure '{}' is on your PATH, \
+                         or set RPEEK_R_COMMAND to the full path. Run `rpeek doctor` to diagnose.",
+                        r_command()
+                    )
+                } else {
+                    anyhow!("failed to start R helper process: {e}")
+                }
+            })?;
 
         let stdin = child
             .stdin
@@ -616,7 +630,9 @@ impl HelperProcess {
             limit: None,
             topic: None,
         })?;
-        helper.send(&ping).context("R helper failed startup ping")?;
+        helper.send(&ping).context(
+            "R helper failed startup ping. Is the 'jsonlite' R package installed? Run `rpeek doctor` to diagnose."
+        )?;
         Ok(helper)
     }
 
@@ -706,6 +722,91 @@ fn r_command() -> String {
     env::var("RPEEK_R_COMMAND")
         .or_else(|_| env::var("RPKG_R_COMMAND"))
         .unwrap_or_else(|_| "R".to_string())
+}
+
+fn doctor_response() -> Value {
+    let r_cmd = r_command();
+    let mut checks = Vec::new();
+    let mut all_ok = true;
+
+    // Check R on PATH
+    match Command::new(&r_cmd)
+        .arg("--version")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+    {
+        Ok(output) => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            let stderr_text = String::from_utf8_lossy(&output.stderr);
+            // R --version prints to stdout on some platforms, stderr on others
+            let version_text = if text.contains("R version") {
+                text.to_string()
+            } else {
+                stderr_text.to_string()
+            };
+            let version_line = version_text
+                .lines()
+                .find(|l| l.contains("R version"))
+                .unwrap_or("unknown version")
+                .trim()
+                .to_string();
+            checks.push(json!({
+                "check": "R",
+                "ok": true,
+                "detail": version_line,
+                "command": r_cmd,
+            }));
+        }
+        Err(_) => {
+            all_ok = false;
+            checks.push(json!({
+                "check": "R",
+                "ok": false,
+                "detail": format!("'{}' not found on PATH", r_cmd),
+                "fix": "Install R from https://cran.r-project.org/ and ensure it is on your PATH.\nOr set RPEEK_R_COMMAND to the full path of your R binary.",
+            }));
+        }
+    }
+
+    // Check jsonlite
+    let jsonlite_ok = Command::new(&r_cmd)
+        .arg("--vanilla")
+        .arg("--slave")
+        .arg("-e")
+        .arg("cat(requireNamespace('jsonlite', quietly=TRUE))")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "TRUE")
+        .unwrap_or(false);
+
+    if jsonlite_ok {
+        checks.push(json!({
+            "check": "jsonlite",
+            "ok": true,
+            "detail": "installed",
+        }));
+    } else if all_ok {
+        // Only report jsonlite if R itself was found
+        all_ok = false;
+        checks.push(json!({
+            "check": "jsonlite",
+            "ok": false,
+            "detail": "R package 'jsonlite' is not installed",
+            "fix": "Rscript -e 'install.packages(\"jsonlite\")'",
+        }));
+    }
+
+    json!({
+        "schema_version": 1,
+        "ok": all_ok,
+        "command": "doctor",
+        "payload": {
+            "checks": checks,
+            "status": if all_ok { "all prerequisites met" } else { "action required — see fix fields above" },
+        }
+    })
 }
 
 fn agent_response() -> Value {
