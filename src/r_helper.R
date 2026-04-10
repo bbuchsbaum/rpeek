@@ -212,6 +212,38 @@ format_signature <- function(obj) {
   paste(capture.output(args(obj)), collapse = "\n")
 }
 
+strip_rd_overstrike <- function(text) {
+  gsub(".\\x08", "", text, perl = TRUE)
+}
+
+trim_blank_edges <- function(lines) {
+  while (length(lines) && !nzchar(trimws(lines[[1]]))) {
+    lines <- lines[-1]
+  }
+  while (length(lines) && !nzchar(trimws(lines[[length(lines)]]))) {
+    lines <- lines[-length(lines)]
+  }
+  lines
+}
+
+plain_rd_sections <- function(text) {
+  lines <- strsplit(text, "\n", fixed = TRUE)[[1]]
+  header_idx <- grep("^[[:alpha:]][[:alnum:][:space:]/()_-]*:$", lines)
+  if (!length(header_idx)) {
+    return(list())
+  }
+
+  sections <- list()
+  for (i in seq_along(header_idx)) {
+    start <- header_idx[[i]]
+    end <- if (i == length(header_idx)) length(lines) else header_idx[[i + 1]] - 1
+    title <- sub(":$", "", lines[[start]])
+    body <- if (start < end) trim_blank_edges(lines[(start + 1):end]) else character()
+    sections[[title]] <- paste(body, collapse = "\n")
+  }
+  sections
+}
+
 best_effort_source <- function(package, name) {
   info <- lookup_object(package, name)
   obj <- info$object
@@ -258,6 +290,10 @@ extract_help_topic <- function(package, topic) {
   }
 
   rd <- utils:::.getHelpFile(path)
+  plain_text <- strip_rd_overstrike(
+    paste(capture.output(tools::Rd2txt(rd, options = list(width = 80))), collapse = "\n")
+  )
+  plain_sections <- plain_rd_sections(plain_text)
   tags <- vapply(rd, attr, character(1), "Rd_tag")
   flatten_rd <- function(x) {
     if (is.character(x)) {
@@ -278,7 +314,8 @@ extract_help_topic <- function(package, topic) {
     paste(trimws(text), collapse = "\n")
   }
 
-  aliases <- trimws(section_text("\\alias"))
+  aliases <- unlist(strsplit(section_text("\\alias") %||% "", "\n", fixed = TRUE))
+  aliases <- trimws(aliases)
   aliases <- aliases[nzchar(aliases)]
 
   list(
@@ -286,12 +323,12 @@ extract_help_topic <- function(package, topic) {
     topic = topic,
     aliases = aliases,
     title = section_text("\\title"),
-    description = section_text("\\description"),
-    usage = section_text("\\usage"),
-    arguments = section_text("\\arguments"),
-    value = section_text("\\value"),
-    examples = section_text("\\examples"),
-    text = paste(capture.output(tools::Rd2txt(rd, options = list(width = 80))), collapse = "\n")
+    description = plain_sections[["Description"]] %||% section_text("\\description"),
+    usage = plain_sections[["Usage"]] %||% section_text("\\usage"),
+    arguments = plain_sections[["Arguments"]] %||% section_text("\\arguments"),
+    value = plain_sections[["Value"]] %||% section_text("\\value"),
+    examples = plain_sections[["Examples"]] %||% section_text("\\examples"),
+    text = plain_text
   )
 }
 

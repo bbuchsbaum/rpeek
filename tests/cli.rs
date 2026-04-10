@@ -1,11 +1,31 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
+
+struct DaemonGuard {
+    socket: PathBuf,
+}
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        shutdown_daemon(&self.socket);
+    }
+}
+
+fn shutdown_daemon(socket: &Path) {
+    let _ = Command::new(env!("CARGO_BIN_EXE_rpeek"))
+        .arg("shutdown")
+        .env("RPEEK_SOCKET", socket)
+        .output();
+}
 
 fn run(args: &[&str]) -> (i32, String) {
     let tempdir = TempDir::new().expect("failed to create tempdir");
     let socket = tempdir.path().join("rpeek-test.sock");
+    let _guard = DaemonGuard {
+        socket: socket.clone(),
+    };
     run_with_socket(&socket, args)
 }
 
@@ -61,13 +81,23 @@ fn doc_returns_usage() {
 
     let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
     assert_eq!(value["payload"]["topic"], "lm");
-    assert!(value["payload"]["usage"].as_str().is_some());
+    let aliases = value["payload"]["aliases"]
+        .as_array()
+        .expect("aliases should be an array");
+    assert!(aliases.iter().any(|alias| alias == "lm"));
+    let usage = value["payload"]["usage"].as_str().expect("missing usage");
+    assert!(usage.contains("lm(formula, data"));
+    assert!(usage.contains("print(x, digits"));
+    assert!(!usage.contains("printlm("));
 }
 
 #[test]
 fn cache_stats_and_clear_work() {
     let tempdir = TempDir::new().expect("failed to create tempdir");
     let socket = tempdir.path().join("rpeek-cache.sock");
+    let _guard = DaemonGuard {
+        socket: socket.clone(),
+    };
 
     let (code, stdout) = run_with_socket(&socket, &["cache", "stats"]);
     assert_eq!(code, 0, "stdout: {stdout}");
@@ -195,9 +225,23 @@ fn missing_object_returns_suggestions() {
 }
 
 #[test]
+fn missing_package_returns_structured_error() {
+    let (code, stdout) = run(&["sig", "definitely_missing_rpeek_package", "lm"]);
+    assert_eq!(code, 2, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["code"], "package_not_found");
+    assert!(value["error"]["hint"].as_str().is_some());
+}
+
+#[test]
 fn batch_returns_nonzero_when_any_item_fails() {
     let tempdir = TempDir::new().expect("failed to create tempdir");
     let socket = tempdir.path().join("rpeek-batch-error.sock");
+    let _guard = DaemonGuard {
+        socket: socket.clone(),
+    };
     let batch_file = tempdir.path().join("requests.jsonl");
     fs::write(
         &batch_file,
@@ -233,6 +277,9 @@ fn batch_returns_nonzero_when_any_item_fails() {
 fn batch_returns_multiple_responses() {
     let tempdir = TempDir::new().expect("failed to create tempdir");
     let socket = tempdir.path().join("rpeek-batch.sock");
+    let _guard = DaemonGuard {
+        socket: socket.clone(),
+    };
     let batch_file = tempdir.path().join("requests.jsonl");
     fs::write(
         &batch_file,

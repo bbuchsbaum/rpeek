@@ -90,6 +90,8 @@ enum Commands {
         #[arg(long)]
         file: Option<PathBuf>,
     },
+    #[command(hide = true, about = "Stop the background daemon")]
+    Shutdown,
     Cache {
         #[command(subcommand)]
         command: CacheCommands,
@@ -315,6 +317,15 @@ fn request_from_command(command: Commands) -> Result<Request> {
         },
         Commands::Agent => bail!("agent is not a daemon command"),
         Commands::Batch { .. } => bail!("batch is not a daemon command"),
+        Commands::Shutdown => Request {
+            action: "shutdown".to_string(),
+            package: String::new(),
+            name: None,
+            query: None,
+            kind: None,
+            limit: None,
+            topic: None,
+        },
         Commands::Serve { .. } => bail!("serve is not a client command"),
         Commands::Doctor => bail!("doctor is not a client command"),
     };
@@ -324,6 +335,15 @@ fn request_from_command(command: Commands) -> Result<Request> {
 
 fn query_daemon(request: &Request) -> Result<Value> {
     let socket = socket_path();
+    if request.action == "shutdown" && !socket.exists() {
+        return Ok(json!({
+            "schema_version": 1,
+            "ok": true,
+            "command": "shutdown",
+            "payload": { "status": "not_running" }
+        }));
+    }
+
     ensure_daemon_running(&socket)?;
 
     let line = serde_json::to_string(request)?;
@@ -472,9 +492,11 @@ fn serve(socket: PathBuf) -> Result<()> {
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
+                let mut should_shutdown = false;
                 let response = match read_request_line(&mut stream).and_then(|line| {
                     let request: Request =
                         serde_json::from_str(&line).context("failed to parse client request")?;
+                    should_shutdown = request.action == "shutdown";
                     handle_request(&request, &line, &mut helper, &mut cache, &socket)
                 }) {
                     Ok(response) => response,
@@ -490,11 +512,15 @@ fn serve(socket: PathBuf) -> Result<()> {
                 };
 
                 let _ = stream.write_all(response.as_bytes());
+                if should_shutdown {
+                    break;
+                }
             }
             Err(err) => return Err(err).context("failed to accept daemon connection"),
         }
     }
 
+    let _ = fs::remove_file(&socket);
     Ok(())
 }
 
@@ -510,6 +536,12 @@ fn handle_request(
             "schema_version": 1,
             "ok": true,
             "payload": { "status": "ok" }
+        })
+        .to_string()),
+        "shutdown" => Ok(json!({
+            "schema_version": 1,
+            "ok": true,
+            "payload": { "status": "daemon_stopping" }
         })
         .to_string()),
         "cache_clear" => Ok(cache.clear_response()),
@@ -530,7 +562,10 @@ fn handle_query_request(
     }
 
     if request.is_cacheable() {
-        let fingerprint = cache.resolve_fingerprint(&request.package, helper, socket)?;
+        let fingerprint = match cache.resolve_fingerprint(&request.package, helper, socket)? {
+            FingerprintResolution::Fingerprint(fingerprint) => fingerprint,
+            FingerprintResolution::ErrorResponse(response) => return Ok(response),
+        };
         let key = CacheKey {
             request: request.clone(),
             fingerprint,
@@ -918,13 +953,11 @@ fn response_exit_code(value: &Value) -> i32 {
         .get("payload")
         .and_then(|payload| payload.get("responses"))
         .and_then(Value::as_array)
-    {
-        if responses
+        && responses
             .iter()
             .any(|response| !response_reports_success(response))
-        {
-            return 2;
-        }
+    {
+        return 2;
     }
 
     0
@@ -944,6 +977,11 @@ struct CacheKey {
 struct PackageState {
     install_path: PathBuf,
     fingerprint: String,
+}
+
+enum FingerprintResolution {
+    Fingerprint(String),
+    ErrorResponse(String),
 }
 
 #[derive(Debug, Default)]
@@ -1007,7 +1045,7 @@ impl ResponseCache {
         package: &str,
         helper: &mut HelperProcess,
         socket: &Path,
-    ) -> Result<String> {
+    ) -> Result<FingerprintResolution> {
         if let Some(state) = self.packages.get_mut(package) {
             let latest = package_fingerprint(&state.install_path)?;
             if latest != state.fingerprint {
@@ -1015,7 +1053,9 @@ impl ResponseCache {
                 self.entries.retain(|key, _| key.request.package != package);
                 self.invalidations += 1;
             }
-            return Ok(state.fingerprint.clone());
+            return Ok(FingerprintResolution::Fingerprint(
+                state.fingerprint.clone(),
+            ));
         }
 
         let fingerprint_request = Request {
@@ -1034,6 +1074,9 @@ impl ResponseCache {
             .context("failed to query R helper for package fingerprint")?;
         let value: Value =
             serde_json::from_str(&response).context("helper returned invalid JSON")?;
+        if !response_reports_success(&value) {
+            return Ok(FingerprintResolution::ErrorResponse(response));
+        }
         let install_path = value
             .get("payload")
             .and_then(|payload| payload.get("install_path"))
@@ -1050,7 +1093,7 @@ impl ResponseCache {
             },
         );
 
-        Ok(fingerprint)
+        Ok(FingerprintResolution::Fingerprint(fingerprint))
     }
 }
 
@@ -1111,7 +1154,7 @@ impl Request {
     fn is_cacheable(&self) -> bool {
         !matches!(
             self.action.as_str(),
-            "ping" | "cache_clear" | "cache_stats" | "fingerprint" | "search_all"
+            "ping" | "shutdown" | "cache_clear" | "cache_stats" | "fingerprint" | "search_all"
         )
     }
 }
