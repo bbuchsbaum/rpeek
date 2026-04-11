@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "rpeek request",
+  "type": "object",
+  "required": ["action"],
+  "properties": {
+    "action": {
+      "type": "string",
+      "enum": [
+        "ping",
+        "fingerprint",
+        "pkg",
+        "exports",
+        "objects",
+        "search",
+        "search_all",
+        "resolve",
+        "summary",
+        "sig",
+        "source",
+        "doc",
+        "methods",
+        "files",
+        "grep",
+        "cache_clear",
+        "cache_stats",
+        "daemon_status",
+        "shutdown"
+      ]
+    },
+    "package": { "type": "string" },
+    "name": { "type": "string" },
+    "topic": { "type": "string" },
+    "query": { "type": "string" },
+    "kind": {
+      "type": "string",
+      "enum": ["all", "object", "topic"]
+    },
+    "limit": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "glob": { "type": "string" }
+  },
+  "additionalProperties": false
+}

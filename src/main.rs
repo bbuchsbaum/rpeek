@@ -1,8 +1,13 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use serde::{Deserialize, Serialize};
+use rpeek::protocol::Request;
+use rpeek::response::{
+    ResponseOptions, apply_response_options, response_exit_code, response_is_success,
+    response_reports_success,
+};
+use rpeek::schema::{SchemaKind, schema_response};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs;
 use std::fs::OpenOptions;
@@ -37,6 +42,24 @@ Examples:
     after_help = AFTER_HELP
 )]
 struct Cli {
+    #[arg(
+        long,
+        global = true,
+        help = "Run one request directly without the daemon"
+    )]
+    no_daemon: bool,
+    #[arg(
+        long,
+        global = true,
+        help = "Trim large string fields to this many bytes"
+    )]
+    max_bytes: Option<usize>,
+    #[arg(
+        long,
+        global = true,
+        help = "Omit examples from documentation payloads"
+    )]
+    no_examples: bool,
     #[command(subcommand)]
     command: Commands,
 }
@@ -69,6 +92,16 @@ enum Commands {
         #[arg(long, default_value_t = 25)]
         limit: usize,
     },
+    #[command(about = "Resolve likely objects/topics from a query")]
+    Resolve {
+        query: String,
+        #[arg(long)]
+        package: Option<String>,
+        #[arg(long, value_enum, default_value_t = SearchKind::All)]
+        kind: SearchKind,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
     #[command(visible_aliases = ["show", "info"], about = "One-call object summary")]
     Summary { package: String, name: String },
     #[command(about = "Function signature or object metadata")]
@@ -81,10 +114,24 @@ enum Commands {
     Methods { package: String, name: String },
     #[command(about = "Installed package files")]
     Files { package: String },
+    #[command(about = "Search installed package files")]
+    Grep {
+        package: String,
+        query: String,
+        #[arg(long)]
+        glob: Option<String>,
+        #[arg(long, default_value_t = 25)]
+        limit: usize,
+    },
     #[command(about = "Quick usage guide for agents and scripts")]
     Agent,
     #[command(about = "Check prerequisites (R, jsonlite, etc.)")]
     Doctor,
+    #[command(about = "Print JSON schema for request or response contracts")]
+    Schema {
+        #[arg(value_enum, default_value_t = SchemaKind::Response)]
+        kind: SchemaKind,
+    },
     #[command(about = "Run multiple JSON requests from stdin or a file")]
     Batch {
         #[arg(long)]
@@ -92,6 +139,11 @@ enum Commands {
     },
     #[command(hide = true, about = "Stop the background daemon")]
     Shutdown,
+    #[command(about = "Inspect or control the background daemon")]
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommands,
+    },
     Cache {
         #[command(subcommand)]
         command: CacheCommands,
@@ -109,6 +161,16 @@ enum CacheCommands {
     Stats,
 }
 
+#[derive(Debug, Subcommand)]
+enum DaemonCommands {
+    #[command(about = "Show daemon status")]
+    Status,
+    #[command(about = "Stop the daemon")]
+    Stop,
+    #[command(about = "Restart the daemon")]
+    Restart,
+}
+
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum SearchKind {
     All,
@@ -124,23 +186,6 @@ impl SearchKind {
             Self::Topic => "topic",
         }
     }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Hash, Eq, PartialEq)]
-struct Request {
-    action: String,
-    #[serde(default)]
-    package: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    query: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    kind: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    limit: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    topic: Option<String>,
 }
 
 fn main() {
@@ -169,6 +214,10 @@ fn main() {
 
 fn run() -> Result<Value> {
     let cli = Cli::parse();
+    let response_options = ResponseOptions {
+        max_bytes: cli.max_bytes,
+        no_examples: cli.no_examples,
+    };
     match cli.command {
         Commands::Serve { socket } => {
             serve(socket)?;
@@ -181,150 +230,93 @@ fn run() -> Result<Value> {
         }
         Commands::Agent => Ok(agent_response()),
         Commands::Doctor => Ok(doctor_response()),
-        Commands::Batch { file } => Ok(batch_response(file)?),
+        Commands::Schema { kind } => Ok(schema_response(kind)),
+        Commands::Batch { file } => Ok(batch_response(file, &response_options)?),
+        Commands::Daemon {
+            command: DaemonCommands::Restart,
+        } => {
+            let _ = query_daemon(&Request::Shutdown, &ResponseOptions::default());
+            let mut value = query_daemon(&Request::DaemonStatus, &response_options)?;
+            if let Some(map) = value.as_object_mut() {
+                map.insert(
+                    "command".to_string(),
+                    Value::String("daemon_restart".to_string()),
+                );
+            }
+            Ok(value)
+        }
         command => {
             let request = request_from_command(command)?;
-            query_daemon(&request)
+            if cli.no_daemon && request.can_run_without_daemon() {
+                query_helper_once(&request, &response_options)
+            } else {
+                query_daemon(&request, &response_options)
+            }
         }
     }
 }
 
 fn request_from_command(command: Commands) -> Result<Request> {
     let request = match command {
-        Commands::Pkg { package } => Request {
-            action: "pkg".to_string(),
-            package,
-            name: None,
-            query: None,
-            kind: None,
-            limit: None,
-            topic: None,
-        },
-        Commands::Exports { package } => Request {
-            action: "exports".to_string(),
-            package,
-            name: None,
-            query: None,
-            kind: None,
-            limit: None,
-            topic: None,
-        },
-        Commands::Objects { package } => Request {
-            action: "objects".to_string(),
-            package,
-            name: None,
-            query: None,
-            kind: None,
-            limit: None,
-            topic: None,
-        },
+        Commands::Pkg { package } => Request::Pkg { package },
+        Commands::Exports { package } => Request::Exports { package },
+        Commands::Objects { package } => Request::Objects { package },
         Commands::Search {
             package,
             query,
             kind,
             limit,
-        } => Request {
-            action: "search".to_string(),
+        } => Request::Search {
             package,
-            name: None,
-            query: Some(query),
-            kind: Some(kind.as_request_value().to_string()),
-            limit: Some(limit.to_string()),
-            topic: None,
+            query,
+            kind: kind.as_request_value().to_string(),
+            limit,
         },
-        Commands::SearchAll { query, kind, limit } => Request {
-            action: "search_all".to_string(),
-            package: String::new(),
-            name: None,
-            query: Some(query),
-            kind: Some(kind.as_request_value().to_string()),
-            limit: Some(limit.to_string()),
-            topic: None,
+        Commands::SearchAll { query, kind, limit } => Request::SearchAll {
+            query,
+            kind: kind.as_request_value().to_string(),
+            limit,
         },
-        Commands::Summary { package, name } => Request {
-            action: "summary".to_string(),
+        Commands::Resolve {
+            query,
             package,
-            name: Some(name),
-            query: None,
-            kind: None,
-            limit: None,
-            topic: None,
-        },
-        Commands::Sig { package, name } => Request {
-            action: "sig".to_string(),
+            kind,
+            limit,
+        } => Request::Resolve {
+            query,
             package,
-            name: Some(name),
-            query: None,
-            kind: None,
-            limit: None,
-            topic: None,
+            kind: kind.as_request_value().to_string(),
+            limit,
         },
-        Commands::Source { package, name } => Request {
-            action: "source".to_string(),
+        Commands::Summary { package, name } => Request::Summary { package, name },
+        Commands::Sig { package, name } => Request::Sig { package, name },
+        Commands::Source { package, name } => Request::Source { package, name },
+        Commands::Doc { package, topic } => Request::Doc { package, topic },
+        Commands::Methods { package, name } => Request::Methods { package, name },
+        Commands::Files { package } => Request::Files { package },
+        Commands::Grep {
             package,
-            name: Some(name),
-            query: None,
-            kind: None,
-            limit: None,
-            topic: None,
-        },
-        Commands::Doc { package, topic } => Request {
-            action: "doc".to_string(),
+            query,
+            glob,
+            limit,
+        } => Request::Grep {
             package,
-            name: None,
-            query: None,
-            kind: None,
-            limit: None,
-            topic: Some(topic),
-        },
-        Commands::Methods { package, name } => Request {
-            action: "methods".to_string(),
-            package,
-            name: Some(name),
-            query: None,
-            kind: None,
-            limit: None,
-            topic: None,
-        },
-        Commands::Files { package } => Request {
-            action: "files".to_string(),
-            package,
-            name: None,
-            query: None,
-            kind: None,
-            limit: None,
-            topic: None,
+            query,
+            glob,
+            limit,
         },
         Commands::Cache { command } => match command {
-            CacheCommands::Clear => Request {
-                action: "cache_clear".to_string(),
-                package: String::new(),
-                name: None,
-                query: None,
-                kind: None,
-                limit: None,
-                topic: None,
-            },
-            CacheCommands::Stats => Request {
-                action: "cache_stats".to_string(),
-                package: String::new(),
-                name: None,
-                query: None,
-                kind: None,
-                limit: None,
-                topic: None,
-            },
+            CacheCommands::Clear => Request::CacheClear,
+            CacheCommands::Stats => Request::CacheStats,
         },
         Commands::Agent => bail!("agent is not a daemon command"),
         Commands::Batch { .. } => bail!("batch is not a daemon command"),
-        Commands::Shutdown => Request {
-            action: "shutdown".to_string(),
-            package: String::new(),
-            name: None,
-            query: None,
-            kind: None,
-            limit: None,
-            topic: None,
+        Commands::Schema { .. } => bail!("schema is not a daemon command"),
+        Commands::Shutdown => Request::Shutdown,
+        Commands::Daemon { command } => match command {
+            DaemonCommands::Status => Request::DaemonStatus,
+            DaemonCommands::Stop => Request::Shutdown,
+            DaemonCommands::Restart => bail!("daemon restart is handled directly"),
         },
         Commands::Serve { .. } => bail!("serve is not a client command"),
         Commands::Doctor => bail!("doctor is not a client command"),
@@ -333,9 +325,9 @@ fn request_from_command(command: Commands) -> Result<Request> {
     Ok(request)
 }
 
-fn query_daemon(request: &Request) -> Result<Value> {
+fn query_daemon(request: &Request, options: &ResponseOptions) -> Result<Value> {
     let socket = socket_path();
-    if request.action == "shutdown" && !socket.exists() {
+    if matches!(request, Request::Shutdown) && !socket.exists() {
         return Ok(json!({
             "schema_version": 1,
             "ok": true,
@@ -353,8 +345,29 @@ fn query_daemon(request: &Request) -> Result<Value> {
     let mut value: Value = serde_json::from_str(response)
         .with_context(|| format!("invalid JSON response from daemon: {response}"))?;
     if let Some(map) = value.as_object_mut() {
-        map.insert("command".to_string(), Value::String(request.action.clone()));
+        map.insert(
+            "command".to_string(),
+            Value::String(request.action().to_string()),
+        );
     }
+    apply_response_options(&mut value, options);
+    Ok(value)
+}
+
+fn query_helper_once(request: &Request, options: &ResponseOptions) -> Result<Value> {
+    let socket = env::temp_dir().join(format!("rpeek-oneshot-{}.sock", std::process::id()));
+    let mut helper = HelperProcess::start(&socket)?;
+    let line = serde_json::to_string(request)?;
+    let response = helper.send(&line)?;
+    let mut value: Value = serde_json::from_str(response.trim())
+        .with_context(|| format!("invalid JSON response from helper: {response}"))?;
+    if let Some(map) = value.as_object_mut() {
+        map.insert(
+            "command".to_string(),
+            Value::String(request.action().to_string()),
+        );
+    }
+    apply_response_options(&mut value, options);
     Ok(value)
 }
 
@@ -421,15 +434,7 @@ fn daemon_is_healthy(socket: &Path) -> bool {
         return false;
     }
 
-    let ping = serde_json::to_string(&Request {
-        action: "ping".to_string(),
-        package: String::new(),
-        name: None,
-        query: None,
-        kind: None,
-        limit: None,
-        topic: None,
-    });
+    let ping = serde_json::to_string(&Request::Ping);
     let Ok(ping) = ping else {
         return false;
     };
@@ -465,13 +470,39 @@ fn send_request_with_retry(socket: &Path, line: &str) -> Result<String> {
     match send_request_line(socket, line, REQUEST_TIMEOUT) {
         Ok(response) => Ok(response),
         Err(_) => {
-            if socket.exists() {
-                let _ = fs::remove_file(socket);
-            }
+            recover_daemon(socket)?;
             ensure_daemon_running(socket)?;
             send_request_line(socket, line, REQUEST_TIMEOUT)
         }
     }
+}
+
+fn recover_daemon(socket: &Path) -> Result<()> {
+    if daemon_is_healthy(socket) {
+        bail!("daemon is healthy but the request failed or timed out");
+    }
+
+    let _ = send_shutdown(socket);
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(2) {
+        if !socket.exists() {
+            return Ok(());
+        }
+        if !daemon_is_healthy(socket) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    if socket.exists() {
+        let _ = fs::remove_file(socket);
+    }
+    Ok(())
+}
+
+fn send_shutdown(socket: &Path) -> Result<String> {
+    let line = serde_json::to_string(&Request::Shutdown)?;
+    send_request_line(socket, &line, HEALTHCHECK_TIMEOUT)
 }
 
 fn serve(socket: PathBuf) -> Result<()> {
@@ -496,7 +527,7 @@ fn serve(socket: PathBuf) -> Result<()> {
                 let response = match read_request_line(&mut stream).and_then(|line| {
                     let request: Request =
                         serde_json::from_str(&line).context("failed to parse client request")?;
-                    should_shutdown = request.action == "shutdown";
+                    should_shutdown = matches!(request, Request::Shutdown);
                     handle_request(&request, &line, &mut helper, &mut cache, &socket)
                 }) {
                     Ok(response) => response,
@@ -531,23 +562,43 @@ fn handle_request(
     cache: &mut ResponseCache,
     socket: &Path,
 ) -> Result<String> {
-    match request.action.as_str() {
-        "ping" => Ok(json!({
+    match request {
+        Request::Ping => Ok(json!({
             "schema_version": 1,
             "ok": true,
             "payload": { "status": "ok" }
         })
         .to_string()),
-        "shutdown" => Ok(json!({
+        Request::DaemonStatus => Ok(daemon_status_response(cache, helper, socket)),
+        Request::Shutdown => Ok(json!({
             "schema_version": 1,
             "ok": true,
             "payload": { "status": "daemon_stopping" }
         })
         .to_string()),
-        "cache_clear" => Ok(cache.clear_response()),
-        "cache_stats" => Ok(cache.stats_response()),
+        Request::CacheClear => Ok(cache.clear_response()),
+        Request::CacheStats => Ok(cache.stats_response()),
         _ => handle_query_request(request, line, helper, cache, socket),
     }
+}
+
+fn daemon_status_response(
+    cache: &ResponseCache,
+    helper: &mut HelperProcess,
+    socket: &Path,
+) -> String {
+    json!({
+        "schema_version": 1,
+        "ok": true,
+        "payload": {
+            "status": "running",
+            "pid": std::process::id(),
+            "socket": socket.display().to_string(),
+            "helper_alive": helper.is_alive(),
+            "cache": cache.stats_payload()
+        }
+    })
+    .to_string()
 }
 
 fn handle_query_request(
@@ -557,12 +608,15 @@ fn handle_query_request(
     cache: &mut ResponseCache,
     socket: &Path,
 ) -> Result<String> {
-    if request.package.is_empty() && request.action != "search_all" {
+    if request.requires_package() && request.package().is_none() {
         bail!("request is missing package");
     }
 
     if request.is_cacheable() {
-        let fingerprint = match cache.resolve_fingerprint(&request.package, helper, socket)? {
+        let package = request
+            .package()
+            .ok_or_else(|| anyhow!("cacheable request is missing package"))?;
+        let fingerprint = match cache.resolve_fingerprint(package, helper, socket)? {
             FingerprintResolution::Fingerprint(fingerprint) => fingerprint,
             FingerprintResolution::ErrorResponse(response) => return Ok(response),
         };
@@ -656,15 +710,7 @@ impl HelperProcess {
             stderr: BufReader::new(stderr),
             script_path,
         };
-        let ping = serde_json::to_string(&Request {
-            action: "ping".to_string(),
-            package: String::new(),
-            name: None,
-            query: None,
-            kind: None,
-            limit: None,
-            topic: None,
-        })?;
+        let ping = serde_json::to_string(&Request::Ping)?;
         helper.send(&ping).context(
             "R helper failed startup ping. Is the 'jsonlite' R package installed? Run `rpeek doctor` to diagnose."
         )?;
@@ -701,6 +747,10 @@ impl HelperProcess {
         }
 
         Ok(response.trim().to_string())
+    }
+
+    fn is_alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
     }
 
     fn read_stderr(&mut self) -> String {
@@ -864,6 +914,14 @@ fn agent_response() -> Value {
                     "command": "rpeek search-all <query>"
                 },
                 {
+                    "task": "Resolve likely objects/topics from an unknown query",
+                    "steps": [
+                        "rpeek resolve <query>",
+                        "rpeek summary <package> <object>",
+                        "rpeek doc <package> <topic>"
+                    ]
+                },
+                {
                     "task": "Get one-call object summary",
                     "command": "rpeek summary <package> <object>"
                 },
@@ -876,6 +934,14 @@ fn agent_response() -> Value {
                     "command": "rpeek doc <package> <topic>"
                 },
                 {
+                    "task": "Search installed package files",
+                    "command": "rpeek grep <package> <query>"
+                },
+                {
+                    "task": "Avoid daemon reuse for isolated checks",
+                    "command": "rpeek --no-daemon summary <package> <object>"
+                },
+                {
                     "task": "Run multiple requests",
                     "command": "rpeek batch --file requests.jsonl"
                 }
@@ -885,13 +951,15 @@ fn agent_response() -> Value {
                 "Use RPEEK_SOCKET=/tmp/<name>.sock to reuse one warm daemon across calls.",
                 "Source kind can be raw_file, deparsed, or unavailable.",
                 "Use search-all for exported symbols and help topics when the package is unknown.",
-                "Batch input is JSON Lines matching the request schema."
+                "Use --max-bytes and --no-examples to keep large payloads compact.",
+                "Batch input is JSON Lines matching the request schema.",
+                "Use rpeek schema request or rpeek schema response to inspect the JSON contract."
             ]
         }
     })
 }
 
-fn batch_response(file: Option<PathBuf>) -> Result<Value> {
+fn batch_response(file: Option<PathBuf>, options: &ResponseOptions) -> Result<Value> {
     let input = match file {
         Some(path) => fs::read_to_string(&path)
             .with_context(|| format!("failed to read batch file {}", path.display()))?,
@@ -910,7 +978,7 @@ fn batch_response(file: Option<PathBuf>) -> Result<Value> {
         }
 
         match serde_json::from_str::<Request>(line) {
-            Ok(request) => match query_daemon(&request) {
+            Ok(request) => match query_daemon(&request, options) {
                 Ok(response) => responses.push(response),
                 Err(err) => responses.push(batch_item_error(index, err.to_string())),
             },
@@ -944,29 +1012,6 @@ fn batch_item_error(index: usize, message: String) -> Value {
     })
 }
 
-fn response_exit_code(value: &Value) -> i32 {
-    if !response_reports_success(value) {
-        return 2;
-    }
-
-    if let Some(responses) = value
-        .get("payload")
-        .and_then(|payload| payload.get("responses"))
-        .and_then(Value::as_array)
-        && responses
-            .iter()
-            .any(|response| !response_reports_success(response))
-    {
-        return 2;
-    }
-
-    0
-}
-
-fn response_reports_success(value: &Value) -> bool {
-    value.get("ok").and_then(Value::as_bool).unwrap_or(false)
-}
-
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 struct CacheKey {
     request: Request,
@@ -984,13 +1029,33 @@ enum FingerprintResolution {
     ErrorResponse(String),
 }
 
-#[derive(Debug, Default)]
 struct ResponseCache {
     entries: HashMap<CacheKey, String>,
+    order: VecDeque<CacheKey>,
     packages: HashMap<String, PackageState>,
     hits: u64,
     misses: u64,
     invalidations: u64,
+    max_entries: usize,
+}
+
+impl Default for ResponseCache {
+    fn default() -> Self {
+        let max_entries = env::var("RPEEK_CACHE_ENTRIES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(512);
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            packages: HashMap::new(),
+            hits: 0,
+            misses: 0,
+            invalidations: 0,
+            max_entries,
+        }
+    }
 }
 
 impl ResponseCache {
@@ -998,6 +1063,7 @@ impl ResponseCache {
         let response = self.entries.get(key).cloned();
         if response.is_some() {
             self.hits += 1;
+            self.touch(key);
         } else {
             self.misses += 1;
         }
@@ -1005,13 +1071,33 @@ impl ResponseCache {
     }
 
     fn insert(&mut self, key: CacheKey, response: String) {
-        self.entries.insert(key, response);
+        if self.entries.contains_key(&key) {
+            self.entries.insert(key.clone(), response);
+            self.touch(&key);
+            return;
+        }
+
+        self.entries.insert(key.clone(), response);
+        self.order.push_back(key);
+        while self.entries.len() > self.max_entries {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn touch(&mut self, key: &CacheKey) {
+        self.order.retain(|candidate| candidate != key);
+        self.order.push_back(key.clone());
     }
 
     fn clear_response(&mut self) -> String {
         let cleared_entries = self.entries.len();
         let cleared_packages = self.packages.len();
         self.entries.clear();
+        self.order.clear();
         self.packages.clear();
 
         json!({
@@ -1025,17 +1111,22 @@ impl ResponseCache {
         .to_string()
     }
 
+    fn stats_payload(&self) -> Value {
+        json!({
+            "entries": self.entries.len(),
+            "packages": self.packages.len(),
+            "hits": self.hits,
+            "misses": self.misses,
+            "invalidations": self.invalidations,
+            "max_entries": self.max_entries
+        })
+    }
+
     fn stats_response(&self) -> String {
         json!({
             "schema_version": 1,
             "ok": true,
-            "payload": {
-                "entries": self.entries.len(),
-                "packages": self.packages.len(),
-                "hits": self.hits,
-                "misses": self.misses,
-                "invalidations": self.invalidations
-            }
+            "payload": self.stats_payload()
         })
         .to_string()
     }
@@ -1050,7 +1141,10 @@ impl ResponseCache {
             let latest = package_fingerprint(&state.install_path)?;
             if latest != state.fingerprint {
                 state.fingerprint = latest.clone();
-                self.entries.retain(|key, _| key.request.package != package);
+                self.entries
+                    .retain(|key, _| key.request.package() != Some(package));
+                self.order
+                    .retain(|key| key.request.package() != Some(package));
                 self.invalidations += 1;
             }
             return Ok(FingerprintResolution::Fingerprint(
@@ -1058,14 +1152,8 @@ impl ResponseCache {
             ));
         }
 
-        let fingerprint_request = Request {
-            action: "fingerprint".to_string(),
+        let fingerprint_request = Request::Fingerprint {
             package: package.to_string(),
-            name: None,
-            query: None,
-            kind: None,
-            limit: None,
-            topic: None,
         };
         let fingerprint_line = serde_json::to_string(&fingerprint_request)?;
         let response = helper
@@ -1141,20 +1229,4 @@ fn path_fingerprint(path: &Path) -> Result<String> {
         .as_secs();
 
     Ok(modified.to_string())
-}
-
-fn response_is_success(response: &str) -> bool {
-    serde_json::from_str::<Value>(response)
-        .ok()
-        .and_then(|value| value.get("ok").and_then(Value::as_bool))
-        .unwrap_or(false)
-}
-
-impl Request {
-    fn is_cacheable(&self) -> bool {
-        !matches!(
-            self.action.as_str(),
-            "ping" | "shutdown" | "cache_clear" | "cache_stats" | "fingerprint" | "search_all"
-        )
-    }
 }

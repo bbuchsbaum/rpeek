@@ -92,6 +92,81 @@ fn doc_returns_usage() {
 }
 
 #[test]
+fn no_daemon_runs_single_request() {
+    let (code, stdout) = run(&["--no-daemon", "sig", "stats", "lm"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(value["command"], "sig");
+    assert_eq!(value["payload"]["name"], "lm");
+}
+
+#[test]
+fn daemon_status_reports_running_daemon() {
+    let tempdir = TempDir::new().expect("failed to create tempdir");
+    let socket = tempdir.path().join("rpeek-status.sock");
+    let _guard = DaemonGuard {
+        socket: socket.clone(),
+    };
+
+    let (code, stdout) = run_with_socket(&socket, &["daemon", "status"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(value["command"], "daemon_status");
+    assert_eq!(value["payload"]["status"], "running");
+    assert!(value["payload"]["pid"].as_u64().is_some());
+    assert!(value["payload"]["cache"]["max_entries"].as_u64().is_some());
+}
+
+#[test]
+fn schema_command_returns_contract() {
+    let (code, stdout) = run(&["schema", "request"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(value["command"], "schema");
+    assert_eq!(value["payload"]["title"], "rpeek request");
+}
+
+#[test]
+fn resolve_finds_stats_lm() {
+    let (code, stdout) = run(&["resolve", "--kind", "object", "--limit", "5", "lm"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(value["command"], "resolve");
+    let candidates = value["payload"]["candidates"]
+        .as_array()
+        .expect("missing candidates");
+    assert!(
+        candidates
+            .iter()
+            .any(|entry| entry["package"] == "stats" && entry["name"] == "lm")
+    );
+}
+
+#[test]
+fn grep_searches_package_files() {
+    let (code, stdout) = run(&["grep", "--limit", "5", "stats", "lm"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(value["command"], "grep");
+    assert!(value["payload"]["matches"].is_array());
+}
+
+#[test]
+fn max_bytes_trims_large_strings() {
+    let (code, stdout) = run(&["--max-bytes", "80", "doc", "stats", "lm"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    let text = value["payload"]["text"].as_str().expect("missing text");
+    assert!(text.contains("[truncated"));
+}
+
+#[test]
 fn cache_stats_and_clear_work() {
     let tempdir = TempDir::new().expect("failed to create tempdir");
     let socket = tempdir.path().join("rpeek-cache.sock");

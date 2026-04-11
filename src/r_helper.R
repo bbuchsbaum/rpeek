@@ -161,17 +161,28 @@ package_description <- function(package) {
     getNamespaceExports(package),
     error = function(...) character()
   )
+  split_field <- function(field) {
+    value <- unname(desc[[field]] %||% "")
+    if (!nzchar(value)) character() else strsplit(value, "\\s*,\\s*")[[1]]
+  }
   list(
     package = package,
     version = unname(desc[["Version"]] %||% NA_character_),
     libpath = dirname(find.package(package)),
     install_path = find.package(package),
     title = unname(desc[["Title"]] %||% NA_character_),
+    description = unname(desc[["Description"]] %||% NA_character_),
+    license = unname(desc[["License"]] %||% NA_character_),
+    authors = unname(desc[["Author"]] %||% NA_character_),
+    maintainer = unname(desc[["Maintainer"]] %||% NA_character_),
+    encoding = unname(desc[["Encoding"]] %||% NA_character_),
+    needs_compilation = unname(desc[["NeedsCompilation"]] %||% NA_character_),
     repository = unname(desc[["Repository"]] %||% NA_character_),
-    url = strsplit(unname(desc[["URL"]] %||% ""), "\\s*,\\s*")[[1]],
-    depends = strsplit(unname(desc[["Depends"]] %||% ""), "\\s*,\\s*")[[1]],
-    imports = strsplit(unname(desc[["Imports"]] %||% ""), "\\s*,\\s*")[[1]],
-    suggests = strsplit(unname(desc[["Suggests"]] %||% ""), "\\s*,\\s*")[[1]],
+    url = split_field("URL"),
+    depends = split_field("Depends"),
+    imports = split_field("Imports"),
+    suggests = split_field("Suggests"),
+    linking_to = split_field("LinkingTo"),
     exports = sort(exports)
   )
 }
@@ -190,6 +201,18 @@ lookup_object <- function(package, name) {
   }
   obj <- get(name, envir = ns, inherits = FALSE)
   srcref <- attr(obj, "srcref", exact = TRUE)
+  srcref_range <- tryCatch({
+    if (is.null(srcref)) {
+      NULL
+    } else {
+      list(
+        start_line = as.integer(srcref[[1]]),
+        start_column = as.integer(srcref[[5]]),
+        end_line = as.integer(srcref[[3]]),
+        end_column = as.integer(srcref[[6]])
+      )
+    }
+  }, error = function(...) NULL)
   src_path <- tryCatch({
     path <- utils::getSrcref(srcref)
     if (length(path) == 0) NA_character_ else as.character(path[[1]])
@@ -201,7 +224,8 @@ lookup_object <- function(package, name) {
     type = typeof(obj),
     class = class(obj),
     mode = mode(obj),
-    srcref_path = src_path
+    srcref_path = src_path,
+    srcref_range = srcref_range
   )
 }
 
@@ -244,6 +268,54 @@ plain_rd_sections <- function(text) {
   sections
 }
 
+parse_arguments_text <- function(text) {
+  if (is.null(text) || !nzchar(text)) {
+    return(list())
+  }
+  lines <- strsplit(text, "\n", fixed = TRUE)[[1]]
+  starts <- grep("^[[:space:]]{0,3}[[:alnum:]_.]+([,[:space:]][[:alnum:]_.]+)*:", lines)
+  if (!length(starts)) {
+    return(list())
+  }
+
+  lapply(seq_along(starts), function(i) {
+    start <- starts[[i]]
+    end <- if (i == length(starts)) length(lines) else starts[[i + 1]] - 1
+    block <- lines[start:end]
+    first <- sub("^\\s+", "", block[[1]])
+    name <- sub(":.*$", "", first)
+    first_desc <- sub("^[^:]+:\\s*", "", first)
+    rest <- if (length(block) > 1) block[-1] else character()
+    description <- paste(trim_blank_edges(c(first_desc, rest)), collapse = "\n")
+    list(
+      name = name,
+      description = description
+    )
+  })
+}
+
+source_from_srcref <- function(path, range) {
+  if (is.null(range) || is.na(path) || !file.exists(path)) {
+    return(NULL)
+  }
+  lines <- readLines(path, warn = FALSE)
+  start_line <- max(1L, as.integer(range$start_line))
+  end_line <- min(length(lines), as.integer(range$end_line))
+  if (is.na(start_line) || is.na(end_line) || start_line > end_line) {
+    return(NULL)
+  }
+  list(
+    origin = normalizePath(path, winslash = "/", mustWork = FALSE),
+    range = list(
+      start_line = start_line,
+      end_line = end_line,
+      start_column = range$start_column,
+      end_column = range$end_column
+    ),
+    text = paste(lines[start_line:end_line], collapse = "\n")
+  )
+}
+
 best_effort_source <- function(package, name) {
   info <- lookup_object(package, name)
   obj <- info$object
@@ -251,17 +323,21 @@ best_effort_source <- function(package, name) {
   if (is.function(obj) || is.language(obj) || is.expression(obj)) {
     kind <- "deparsed"
     origin <- "installed_object"
+    range <- NULL
     text <- paste(deparse(obj), collapse = "\n")
-    if (!is.na(info$srcref_path) && file.exists(info$srcref_path)) {
-      text <- paste(readLines(info$srcref_path, warn = FALSE), collapse = "\n")
+    srcref_source <- source_from_srcref(info$srcref_path, info$srcref_range)
+    if (!is.null(srcref_source)) {
+      text <- srcref_source$text
       kind <- "raw_file"
-      origin <- normalizePath(info$srcref_path, winslash = "/", mustWork = FALSE)
+      origin <- srcref_source$origin
+      range <- srcref_source$range
     }
     return(list(
       package = package,
       name = name,
       kind = kind,
       origin = origin,
+      range = range,
       language = "R",
       text = text
     ))
@@ -272,6 +348,7 @@ best_effort_source <- function(package, name) {
     name = name,
     kind = "unavailable",
     origin = "installed_object",
+    range = NULL,
     language = NULL,
     text = NULL
   )
@@ -317,6 +394,7 @@ extract_help_topic <- function(package, topic) {
   aliases <- unlist(strsplit(section_text("\\alias") %||% "", "\n", fixed = TRUE))
   aliases <- trimws(aliases)
   aliases <- aliases[nzchar(aliases)]
+  arguments_text <- plain_sections[["Arguments"]] %||% section_text("\\arguments")
 
   list(
     package = package,
@@ -325,7 +403,8 @@ extract_help_topic <- function(package, topic) {
     title = section_text("\\title"),
     description = plain_sections[["Description"]] %||% section_text("\\description"),
     usage = plain_sections[["Usage"]] %||% section_text("\\usage"),
-    arguments = plain_sections[["Arguments"]] %||% section_text("\\arguments"),
+    arguments = arguments_text,
+    arguments_detail = parse_arguments_text(arguments_text),
     value = plain_sections[["Value"]] %||% section_text("\\value"),
     examples = plain_sections[["Examples"]] %||% section_text("\\examples"),
     text = plain_text
@@ -343,15 +422,22 @@ list_objects <- function(package, exports_only = FALSE) {
 
 list_methods <- function(package, name) {
   normalize_package(package)
+  ns <- asNamespace(package)
   s3_methods <- tryCatch(
     sort(unique(utils::methods(name))),
     error = function(...) character()
   )
+  package_s3_methods <- tryCatch({
+    registered <- get(".__S3MethodsTable__.", envir = ns, inherits = FALSE)
+    package_methods <- ls(registered, all.names = TRUE)
+    package_methods[startsWith(package_methods, paste0(name, "."))]
+  }, error = function(...) character())
+  s3_methods <- sort(unique(c(as.character(s3_methods), package_s3_methods)))
   s4_methods <- tryCatch({
-    if (!methods::isGeneric(name)) {
+    if (!methods::isGeneric(name, where = ns)) {
       character()
     } else {
-      shown <- capture.output(show(methods::findMethods(name)))
+      shown <- capture.output(show(methods::findMethods(name, where = ns)))
       shown[nzchar(trimws(shown))]
     }
   }, error = function(...) character())
@@ -602,6 +688,123 @@ search_package <- function(package, query, kind = "all", limit = 25) {
   )
 }
 
+enrich_resolve_match <- function(record) {
+  package <- record[["package"]]
+  if (is.null(package)) {
+    return(record)
+  }
+  label <- record[["name"]] %||% record[["topic"]]
+  if (is.null(label)) {
+    return(record)
+  }
+  record$has_doc <- !is.null(tryCatch(help_topic_summary(package, label), error = function(...) NULL))
+  record$has_source <- if (identical(record[["kind"]], "object")) {
+    !identical(tryCatch(best_effort_source(package, label)$kind, error = function(...) "unavailable"), "unavailable")
+  } else {
+    FALSE
+  }
+  record
+}
+
+resolve_query <- function(query, package = NULL, kind = "all", limit = 10) {
+  kind <- match.arg(kind, c("all", "object", "topic"))
+  limit <- suppressWarnings(as.integer(limit))
+  if (is.na(limit) || limit < 1) {
+    limit <- 10
+  }
+  limit <- min(limit, 50)
+
+  base <- if (!is.null(package) && nzchar(package)) {
+    result <- search_package(package, query, kind = kind, limit = limit)
+    result$matches <- lapply(result$matches, function(record) {
+      record$package <- package
+      record
+    })
+    result$scope <- "package"
+    result
+  } else {
+    search_all_packages(query, kind = kind, limit = limit)
+  }
+
+  matches <- base$matches
+  if (length(matches)) {
+    matches <- lapply(matches, enrich_resolve_match)
+  }
+
+  list(
+    query = query,
+    package = package,
+    kind = kind,
+    limit = limit,
+    scope = base$scope %||% "installed_packages",
+    candidates = matches,
+    counts = base$counts
+  )
+}
+
+path_matches_glob <- function(path, glob) {
+  if (is.null(glob) || !nzchar(glob)) {
+    return(TRUE)
+  }
+  grepl(utils::glob2rx(glob), path)
+}
+
+grep_package_files <- function(package, query, glob = NULL, limit = 25) {
+  pkg_path <- normalize_package(package)
+  limit <- suppressWarnings(as.integer(limit))
+  if (is.na(limit) || limit < 1) {
+    limit <- 25
+  }
+  limit <- min(limit, 200)
+
+  files <- list.files(pkg_path, recursive = TRUE, all.files = TRUE, no.. = TRUE)
+  files <- files[path_matches_glob(files, glob)]
+  matches <- list()
+  scanned <- 0L
+
+  for (rel in files) {
+    full <- file.path(pkg_path, rel)
+    if (!file.info(full)$isdir && file.info(full)$size <= 1024 * 1024) {
+      text <- tryCatch(readLines(full, warn = FALSE, encoding = "UTF-8"), error = function(...) NULL)
+      if (is.null(text)) {
+        next
+      }
+      scanned <- scanned + 1L
+      idx <- grep(query, text, fixed = TRUE, ignore.case = TRUE)
+      if (length(idx)) {
+        for (line_no in idx) {
+          matches[[length(matches) + 1L]] <- list(
+            path = rel,
+            line = as.integer(line_no),
+            text = text[[line_no]]
+          )
+          if (length(matches) >= limit) {
+            return(list(
+              package = package,
+              install_path = pkg_path,
+              query = query,
+              glob = glob,
+              scanned_files = scanned,
+              matches = matches,
+              truncated = TRUE
+            ))
+          }
+        }
+      }
+    }
+  }
+
+  list(
+    package = package,
+    install_path = pkg_path,
+    query = query,
+    glob = glob,
+    scanned_files = scanned,
+    matches = matches,
+    truncated = FALSE
+  )
+}
+
 summary_for_object <- function(package, name) {
   info <- object_info(package, name)
   source <- best_effort_source(package, name)
@@ -623,6 +826,7 @@ summary_for_object <- function(package, name) {
     source = list(
       kind = source$kind,
       origin = source$origin,
+      range = source$range,
       language = source$language
     ),
     doc = doc,
@@ -637,6 +841,7 @@ dispatch <- function(req) {
   kind <- req[["kind"]] %||% "all"
   limit <- req[["limit"]] %||% "25"
   topic <- req[["topic"]]
+  glob <- req[["glob"]]
 
   payload <- switch(
     req[["action"]],
@@ -651,12 +856,14 @@ dispatch <- function(req) {
     "objects" = list(package = package, objects = list_objects(package, FALSE)),
     "search" = search_package(package, query, kind = kind, limit = limit),
     "search_all" = search_all_packages(query, kind = kind, limit = limit),
+    "resolve" = resolve_query(query, package = package, kind = kind, limit = limit),
     "summary" = summary_for_object(package, name),
     "sig" = object_info(package, name),
     "source" = best_effort_source(package, name),
     "doc" = extract_help_topic(package, topic %||% name),
     "methods" = list_methods(package, name),
     "files" = list_files(package),
+    "grep" = grep_package_files(package, query, glob = glob, limit = limit),
     stop(sprintf("unknown action '%s'", req[["action"]]))
   )
 

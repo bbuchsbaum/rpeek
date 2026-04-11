@@ -6,6 +6,8 @@ Fast installed-R-package introspection for coding agents.
 
 The installed binary is `rpeek`.
 
+Rust API and internal architecture docs are published at <https://bbuchsbaum.github.io/rpeek/>.
+
 ## Why This Exists
 
 Installed R packages are awkward to inspect programmatically:
@@ -22,6 +24,16 @@ The helper process requires the R package `jsonlite` for robust request/response
 ## Platform Support
 
 `rpeek` currently targets Unix-like systems: macOS and Linux. It uses Unix domain sockets for the local daemon, so Windows is not supported yet unless run inside a Unix-like environment such as WSL.
+
+## Rust Docs
+
+Browse the generated Rust docs locally:
+
+```bash
+cargo doc --no-deps --open
+```
+
+The GitHub Pages docs site is built from the same output and published by the `Docs` workflow.
 
 ## Install
 
@@ -101,6 +113,7 @@ If you installed with `cargo install`, run commands directly:
 ```bash
 rpeek search stats lm
 rpeek search-all --kind object --limit 10 lm
+rpeek resolve lm
 rpeek summary stats lm
 rpeek source stats lm
 rpeek doc stats lm
@@ -117,6 +130,7 @@ Then run a few common commands:
 ```bash
 cargo run -- search stats lm
 cargo run -- search-all --kind object --limit 10 lm
+cargo run -- resolve lm
 cargo run -- summary stats lm
 cargo run -- source stats lm
 cargo run -- doc stats lm
@@ -144,6 +158,12 @@ Find a symbol when you do not know the package:
 cargo run -- search-all --kind object --limit 10 lm
 ```
 
+Resolve likely objects and topics from a query:
+
+```bash
+cargo run -- resolve lm
+```
+
 Get one compact summary payload:
 
 ```bash
@@ -160,6 +180,18 @@ Read installed docs:
 
 ```bash
 cargo run -- doc stats lm
+```
+
+Keep large responses compact:
+
+```bash
+cargo run -- --max-bytes 4000 --no-examples doc stats lm
+```
+
+Search installed package files:
+
+```bash
+cargo run -- grep stats lm.fit
 ```
 
 Run multiple requests in one process:
@@ -239,10 +271,29 @@ target/debug/rpeek cache stats
 target/debug/rpeek cache clear
 ```
 
-Stop a daemon bound to an explicit socket:
+Inspect, stop, or restart a daemon bound to an explicit socket:
 
 ```bash
-RPEEK_SOCKET=/tmp/rpeek-demo.sock target/debug/rpeek shutdown
+RPEEK_SOCKET=/tmp/rpeek-demo.sock target/debug/rpeek daemon status
+RPEEK_SOCKET=/tmp/rpeek-demo.sock target/debug/rpeek daemon stop
+RPEEK_SOCKET=/tmp/rpeek-demo.sock target/debug/rpeek daemon restart
+```
+
+For a single isolated request without daemon reuse:
+
+```bash
+target/debug/rpeek --no-daemon summary stats lm
+```
+
+Cache size defaults to 512 successful responses. Override it with `RPEEK_CACHE_ENTRIES`.
+
+## Protocol Schema
+
+Print the current JSON request or response contract:
+
+```bash
+rpeek schema request
+rpeek schema response
 ```
 
 ## Troubleshooting
@@ -279,5 +330,7 @@ cargo run -- summary stats lm
 cargo run -- source stats lm
 cargo run -- doc stats lm
 cargo run -- sig stats lmx
+cargo run -- resolve lm
+cargo run -- grep stats lm
 echo $?
 ```

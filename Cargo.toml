@@ -2,6 +2,9 @@
 name = "rpeek"
 version = "0.1.0"
 edition = "2024"
+description = "Fast installed-R-package introspection for coding agents"
+repository = "https://github.com/bbuchsbaum/rpeek"
+documentation = "https://bbuchsbaum.github.io/rpeek/"
 
 [dependencies]
 anyhow = "1.0"
