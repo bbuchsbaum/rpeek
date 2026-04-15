@@ -53,21 +53,47 @@ You need three things:
 
 After installing Rust, make sure Cargo's binary directory is on your `PATH`. For a default rustup install this is usually `~/.cargo/bin`.
 
-### 2. Install rpeek
+### 2. Choose a user-local bin directory
 
-Install from GitHub:
+For a new system, prefer installing `rpeek` into a user-owned bin directory that is already on your shell `PATH`, or that you can add once in your shell startup file.
+
+Recommended default on macOS and Linux:
 
 ```bash
-cargo install --git https://github.com/bbuchsbaum/rpeek.git
+mkdir -p "$HOME/.local/bin"
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+If you prefer `~/bin` instead:
+
+```bash
+mkdir -p "$HOME/bin"
+export PATH="$HOME/bin:$PATH"
+```
+
+To make that persistent, add the matching line to your shell startup file such as `~/.zshrc`, `~/.bashrc`, or `~/.profile`.
+
+### 3. Install rpeek
+
+Install from GitHub into `~/.local/bin`:
+
+```bash
+cargo install --git https://github.com/bbuchsbaum/rpeek.git --root "$HOME/.local"
+```
+
+Install from GitHub into `~/bin`:
+
+```bash
+cargo install --git https://github.com/bbuchsbaum/rpeek.git --root "$HOME"
 ```
 
 Or from a local clone:
 
 ```bash
-cargo install --path .
+cargo install --path . --root "$HOME/.local"
 ```
 
-### 3. Verify the install
+### 4. Verify the install
 
 ```bash
 rpeek doctor
@@ -79,8 +105,16 @@ Then try it out:
 
 ```bash
 rpeek sig stats lm
+rpeek sigs stats
 rpeek doc stats lm
 rpeek search-all lm
+```
+
+If `rpeek` is not found after install, check that your chosen bin directory is on `PATH`:
+
+```bash
+command -v rpeek
+echo "$PATH"
 ```
 
 If R is installed but not named `R` on your `PATH`, point `rpeek` at it:
@@ -99,6 +133,7 @@ RPEEK_R_COMMAND=/full/path/to/R rpeek doctor
 - search filtering by result kind and limit
 - one-call object summaries
 - function signatures
+- package-wide function signature listing
 - best-effort source retrieval
 - installed help / roxygen-derived docs
 - S3 and S4 method discovery
@@ -113,6 +148,7 @@ If you installed with `cargo install`, run commands directly:
 ```bash
 rpeek search stats lm
 rpeek search-all --kind object --limit 10 lm
+rpeek sigs stats
 rpeek resolve lm
 rpeek summary stats lm
 rpeek source stats lm
@@ -130,6 +166,7 @@ Then run a few common commands:
 ```bash
 cargo run -- search stats lm
 cargo run -- search-all --kind object --limit 10 lm
+cargo run -- sigs stats
 cargo run -- resolve lm
 cargo run -- summary stats lm
 cargo run -- source stats lm
@@ -141,6 +178,7 @@ If you prefer the built binary:
 
 ```bash
 target/debug/rpeek search stats lm
+target/debug/rpeek sigs stats
 target/debug/rpeek summary stats lm
 ```
 
@@ -168,6 +206,18 @@ Get one compact summary payload:
 
 ```bash
 cargo run -- summary stats lm
+```
+
+List exported function signatures for one package:
+
+```bash
+cargo run -- sigs stats
+```
+
+Include non-exported namespace functions too:
+
+```bash
+cargo run -- sigs --all-objects stats
 ```
 
 Read best-effort source:
@@ -330,6 +380,7 @@ cargo run -- summary stats lm
 cargo run -- source stats lm
 cargo run -- doc stats lm
 cargo run -- sig stats lmx
+cargo run -- sigs stats
 cargo run -- resolve lm
 cargo run -- grep stats lm
 echo $?
