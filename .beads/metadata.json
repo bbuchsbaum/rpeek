@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "rpeek",
+  "project_id": "8fbb4321-18f5-4685-80fe-83c2306a730e"
+}
