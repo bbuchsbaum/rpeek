@@ -241,6 +241,8 @@ enum IndexCommands {
         query: String,
         #[arg(long, default_value_t = 25)]
         limit: usize,
+        #[arg(long, help = "Pass the query to SQLite MATCH without normalization")]
+        raw_match: bool,
     },
 }
 
@@ -280,6 +282,41 @@ enum SnippetCommands {
     },
     #[command(about = "Show one stored snippet")]
     Show { id: i64 },
+    #[command(about = "Edit one stored snippet in place")]
+    Edit {
+        id: i64,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long = "package")]
+        packages: Vec<String>,
+        #[arg(long = "object")]
+        objects: Vec<String>,
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        #[arg(long = "verb")]
+        verbs: Vec<String>,
+        #[arg(long, value_enum)]
+        status: Option<SnippetStatusArg>,
+        #[arg(long)]
+        source: Option<String>,
+        #[arg(long, conflicts_with = "body")]
+        file: Option<PathBuf>,
+        #[arg(long, conflicts_with = "file")]
+        body: Option<String>,
+    },
+    #[command(about = "Export one snippet or the whole snippet store as JSON")]
+    Export {
+        id: Option<i64>,
+        #[arg(long, conflicts_with = "id")]
+        all: bool,
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+    #[command(about = "Import snippets from a JSON export bundle")]
+    Import {
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
     #[command(about = "Refresh recorded package versions for one snippet")]
     Refresh {
         id: i64,
@@ -297,6 +334,8 @@ enum SnippetCommands {
         status: Option<SnippetStatusArg>,
         #[arg(long, default_value_t = 25)]
         limit: usize,
+        #[arg(long, help = "Pass the query to SQLite MATCH without normalization")]
+        raw_match: bool,
     },
     #[command(about = "Delete one stored snippet")]
     Delete { id: i64 },
@@ -331,6 +370,31 @@ struct SnippetStatusEvaluation {
     effective_status: String,
     stale_packages: Vec<StalePackageInfo>,
     current_package_versions: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct SnippetExportBundle {
+    format: String,
+    exported_at: i64,
+    snippets: Vec<SnippetExportRecord>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct SnippetExportRecord {
+    id: i64,
+    #[serde(default)]
+    key: Option<String>,
+    title: String,
+    body: String,
+    packages: Vec<String>,
+    objects: Vec<String>,
+    tags: Vec<String>,
+    verbs: Vec<String>,
+    status: String,
+    source: Option<String>,
+    package_versions: BTreeMap<String, String>,
+    created_at: i64,
+    updated_at: i64,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -425,8 +489,9 @@ fn run() -> Result<Value> {
                     package,
                     query,
                     limit,
+                    raw_match,
                 },
-        } => Ok(index_search_response(&package, &query, limit)?),
+        } => Ok(index_search_response(&package, &query, limit, raw_match)?),
         Commands::MethodsAcross { generic, packages } => {
             Ok(methods_across_response(&generic, &packages)?)
         }
@@ -1430,9 +1495,15 @@ fn index_show_response(package: &str) -> Result<Value> {
     }))
 }
 
-fn index_search_response(package: &str, query: &str, limit: usize) -> Result<Value> {
+fn index_search_response(
+    package: &str,
+    query: &str,
+    limit: usize,
+    raw_match: bool,
+) -> Result<Value> {
     let store = IndexStore::open_default()?;
-    let matches = store.search_package_documents(package, query, limit)?;
+    let match_query = rpeek::index::prepare_match_query(query, raw_match);
+    let matches = store.search_package_documents(package, query, limit, raw_match)?;
     Ok(json!({
         "schema_version": 1,
         "ok": true,
@@ -1440,6 +1511,8 @@ fn index_search_response(package: &str, query: &str, limit: usize) -> Result<Val
         "payload": {
             "package": package,
             "query": query,
+            "match_query": match_query,
+            "raw_match": raw_match,
             "limit": limit,
             "matches": matches,
             "count": matches.len()
@@ -1482,6 +1555,33 @@ fn snippet_response(command: SnippetCommands) -> Result<Value> {
             limit,
         ),
         SnippetCommands::Show { id } => snippet_show_response(id),
+        SnippetCommands::Edit {
+            id,
+            title,
+            packages,
+            objects,
+            tags,
+            verbs,
+            status,
+            source,
+            file,
+            body,
+        } => snippet_edit_response(
+            id,
+            title,
+            &packages,
+            &objects,
+            &tags,
+            &verbs,
+            status.map(SnippetStatusArg::as_str),
+            source,
+            file.as_deref(),
+            body.as_deref(),
+        ),
+        SnippetCommands::Export { id, all, file } => {
+            snippet_export_response(id, all, file.as_deref())
+        }
+        SnippetCommands::Import { file } => snippet_import_response(file.as_deref()),
         SnippetCommands::Refresh { id, status } => {
             snippet_refresh_response(id, status.map(SnippetStatusArg::as_str))
         }
@@ -1491,12 +1591,14 @@ fn snippet_response(command: SnippetCommands) -> Result<Value> {
             tag,
             status,
             limit,
+            raw_match,
         } => snippet_search_response(
             &query,
             package.as_deref(),
             tag.as_deref(),
             status.map(SnippetStatusArg::as_str),
             limit,
+            raw_match,
         ),
         SnippetCommands::Delete { id } => snippet_delete_response(id),
     }
@@ -1517,6 +1619,7 @@ fn snippet_add_response(
     let package_versions = indexed_package_versions(packages)?;
     let mut store = IndexStore::open_default()?;
     let snippet = store.add_snippet(&NewSnippet {
+        key: None,
         title: title.to_string(),
         body,
         packages: packages.to_vec(),
@@ -1585,6 +1688,236 @@ fn snippet_show_response(id: i64) -> Result<Value> {
     }))
 }
 
+fn snippet_edit_response(
+    id: i64,
+    title: Option<String>,
+    packages: &[String],
+    objects: &[String],
+    tags: &[String],
+    verbs: &[String],
+    status: Option<&str>,
+    source: Option<String>,
+    file: Option<&Path>,
+    body: Option<&str>,
+) -> Result<Value> {
+    let mut store = IndexStore::open_default()?;
+    let existing = store
+        .get_snippet(id)?
+        .ok_or_else(|| anyhow!("snippet '{id}' was not found"))?;
+
+    let body_override = if file.is_some() || body.is_some() {
+        Some(snippet_body_input(file, body)?)
+    } else {
+        None
+    };
+
+    if title.is_none()
+        && packages.is_empty()
+        && objects.is_empty()
+        && tags.is_empty()
+        && verbs.is_empty()
+        && status.is_none()
+        && source.is_none()
+        && body_override.is_none()
+    {
+        bail!("snippet edit needs at least one field to update");
+    }
+
+    let merged_packages = if packages.is_empty() {
+        existing.packages.clone()
+    } else {
+        packages.to_vec()
+    };
+    let merged_objects = if objects.is_empty() {
+        existing.objects.clone()
+    } else {
+        objects.to_vec()
+    };
+    let merged_tags = if tags.is_empty() {
+        existing.tags.clone()
+    } else {
+        tags.to_vec()
+    };
+    let merged_verbs = if verbs.is_empty() {
+        existing.verbs.clone()
+    } else {
+        verbs.to_vec()
+    };
+    let updated = NewSnippet {
+        key: Some(existing.key.clone()),
+        title: title.unwrap_or_else(|| existing.title.clone()),
+        body: body_override.unwrap_or_else(|| existing.body.clone()),
+        packages: merged_packages.clone(),
+        objects: merged_objects,
+        tags: merged_tags,
+        verbs: merged_verbs,
+        status: status.unwrap_or(existing.status.as_str()).to_string(),
+        source: source.or_else(|| existing.source.clone()),
+        package_versions: indexed_package_versions(&merged_packages)?,
+    };
+
+    let edited = store
+        .update_snippet(id, &updated)?
+        .ok_or_else(|| anyhow!("snippet '{id}' disappeared during edit"))?;
+    let current_versions = current_package_versions_for_snippets(std::slice::from_ref(&edited))?;
+    let evaluation = evaluate_snippet_status(&edited, &current_versions);
+
+    Ok(json!({
+        "schema_version": 1,
+        "ok": true,
+        "command": "snippet_edit",
+        "payload": snippet_json(&edited, &evaluation),
+    }))
+}
+
+fn snippet_export_response(id: Option<i64>, all: bool, file: Option<&Path>) -> Result<Value> {
+    if id.is_none() && !all {
+        bail!("snippet export needs an id or --all");
+    }
+    let store = IndexStore::open_default()?;
+    let snippets = if all {
+        store.list_snippets(None, None, None, usize::MAX)?
+    } else {
+        vec![
+            store
+                .get_snippet(id.expect("validated"))?
+                .ok_or_else(|| anyhow!("snippet '{}' was not found", id.unwrap_or_default()))?,
+        ]
+    };
+    let bundle = SnippetExportBundle {
+        format: "rpeek.snippets.v1".to_string(),
+        exported_at: now_timestamp()?,
+        snippets: snippets.iter().map(export_record_from_snippet).collect(),
+    };
+
+    if let Some(path) = file {
+        let text = serde_json::to_string_pretty(&bundle)?;
+        fs::write(path, text)
+            .with_context(|| format!("failed to write snippet export to {}", path.display()))?;
+        Ok(json!({
+            "schema_version": 1,
+            "ok": true,
+            "command": "snippet_export",
+            "payload": {
+                "count": bundle.snippets.len(),
+                "path": path.display().to_string(),
+            }
+        }))
+    } else {
+        Ok(json!({
+            "schema_version": 1,
+            "ok": true,
+            "command": "snippet_export",
+            "payload": {
+                "count": bundle.snippets.len(),
+                "bundle": bundle,
+            }
+        }))
+    }
+}
+
+fn snippet_import_response(file: Option<&Path>) -> Result<Value> {
+    let text = if let Some(path) = file {
+        fs::read_to_string(path)
+            .with_context(|| format!("failed to read snippet import file {}", path.display()))?
+    } else {
+        let mut stdin = String::new();
+        std::io::stdin()
+            .read_to_string(&mut stdin)
+            .context("failed to read snippet import from stdin")?;
+        stdin
+    };
+    let bundle: SnippetExportBundle =
+        serde_json::from_str(&text).context("failed to parse snippet import bundle")?;
+    if bundle.format != "rpeek.snippets.v1" {
+        bail!("unsupported snippet bundle format '{}'", bundle.format);
+    }
+
+    let mut store = IndexStore::open_default()?;
+    let mut imported = Vec::new();
+    let mut existing_snippets = store.list_snippets(None, None, None, usize::MAX)?;
+    for snippet in &bundle.snippets {
+        let incoming = NewSnippet {
+            key: snippet.key.clone(),
+            title: snippet.title.clone(),
+            body: snippet.body.clone(),
+            packages: snippet.packages.clone(),
+            objects: snippet.objects.clone(),
+            tags: snippet.tags.clone(),
+            verbs: snippet.verbs.clone(),
+            status: snippet.status.clone(),
+            source: snippet.source.clone(),
+            package_versions: snippet.package_versions.clone(),
+        };
+        let merge_target = match incoming.key.as_deref() {
+            Some(key) => store.get_snippet_by_key(key)?,
+            None => existing_snippets
+                .iter()
+                .find(|existing| {
+                    snippet_merge_fingerprint(existing) == snippet_export_fingerprint(snippet)
+                })
+                .cloned(),
+        };
+
+        if let Some(existing) = merge_target {
+            let merged = store
+                .update_snippet(
+                    existing.id,
+                    &NewSnippet {
+                        key: Some(existing.key.clone()),
+                        ..incoming
+                    },
+                )?
+                .ok_or_else(|| anyhow!("snippet '{}' disappeared during merge", existing.id))?;
+            if let Some(index) = existing_snippets
+                .iter()
+                .position(|entry| entry.id == merged.id)
+            {
+                existing_snippets[index] = merged.clone();
+            } else {
+                existing_snippets.push(merged.clone());
+            }
+            imported.push(json!({
+                "source_id": snippet.id,
+                "new_id": merged.id,
+                "key": merged.key,
+                "title": merged.title,
+                "action": "merged",
+            }));
+        } else {
+            let inserted = store.add_snippet(&incoming)?;
+            existing_snippets.push(inserted.clone());
+            imported.push(json!({
+                "source_id": snippet.id,
+                "new_id": inserted.id,
+                "key": inserted.key,
+                "title": inserted.title,
+                "action": "inserted",
+            }));
+        }
+    }
+
+    let inserted_count = imported
+        .iter()
+        .filter(|entry| entry["action"] == "inserted")
+        .count();
+    let merged_count = imported
+        .iter()
+        .filter(|entry| entry["action"] == "merged")
+        .count();
+    Ok(json!({
+        "schema_version": 1,
+        "ok": true,
+        "command": "snippet_import",
+        "payload": {
+            "count": imported.len(),
+            "inserted": inserted_count,
+            "merged": merged_count,
+            "imports": imported,
+        }
+    }))
+}
+
 fn snippet_refresh_response(id: i64, status: Option<&str>) -> Result<Value> {
     let mut store = IndexStore::open_default()?;
     let snippet = store
@@ -1611,9 +1944,11 @@ fn snippet_search_response(
     tag: Option<&str>,
     status: Option<&str>,
     limit: usize,
+    raw_match: bool,
 ) -> Result<Value> {
     let store = IndexStore::open_default()?;
-    let matches = store.search_snippets(query, package, tag, status, limit)?;
+    let match_query = rpeek::index::prepare_match_query(query, raw_match);
+    let matches = store.search_snippets(query, package, tag, status, limit, raw_match)?;
     let snippet_rows = matches
         .iter()
         .filter_map(|entry| entry.key.parse::<i64>().ok())
@@ -1649,6 +1984,8 @@ fn snippet_search_response(
         "command": "snippet_search",
         "payload": {
             "query": query,
+            "match_query": match_query,
+            "raw_match": raw_match,
             "filters": {
                 "package": package,
                 "tag": tag,
@@ -1702,6 +2039,7 @@ fn indexed_package_versions(packages: &[String]) -> Result<BTreeMap<String, Stri
 fn snippet_json(snippet: &IndexedSnippet, evaluation: &SnippetStatusEvaluation) -> Value {
     json!({
         "id": snippet.id,
+        "key": snippet.key,
         "title": snippet.title,
         "body": snippet.body,
         "packages": snippet.packages,
@@ -1722,6 +2060,7 @@ fn snippet_json(snippet: &IndexedSnippet, evaluation: &SnippetStatusEvaluation) 
 fn snippet_summary_json(snippet: &IndexedSnippet, evaluation: &SnippetStatusEvaluation) -> Value {
     json!({
         "id": snippet.id,
+        "key": snippet.key,
         "title": snippet.title,
         "status": snippet.status,
         "effective_status": evaluation.effective_status,
@@ -1825,6 +2164,71 @@ fn stale_packages_json(stale_packages: &[StalePackageInfo]) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+fn export_record_from_snippet(snippet: &IndexedSnippet) -> SnippetExportRecord {
+    SnippetExportRecord {
+        id: snippet.id,
+        key: Some(snippet.key.clone()),
+        title: snippet.title.clone(),
+        body: snippet.body.clone(),
+        packages: snippet.packages.clone(),
+        objects: snippet.objects.clone(),
+        tags: snippet.tags.clone(),
+        verbs: snippet.verbs.clone(),
+        status: snippet.status.clone(),
+        source: snippet.source.clone(),
+        package_versions: snippet.package_versions.clone(),
+        created_at: snippet.created_at,
+        updated_at: snippet.updated_at,
+    }
+}
+
+fn snippet_merge_fingerprint(snippet: &IndexedSnippet) -> String {
+    snippet_content_fingerprint(
+        &snippet.title,
+        &snippet.body,
+        &snippet.packages,
+        &snippet.objects,
+        &snippet.tags,
+        &snippet.verbs,
+        snippet.source.as_deref(),
+    )
+}
+
+fn snippet_export_fingerprint(snippet: &SnippetExportRecord) -> String {
+    snippet_content_fingerprint(
+        &snippet.title,
+        &snippet.body,
+        &snippet.packages,
+        &snippet.objects,
+        &snippet.tags,
+        &snippet.verbs,
+        snippet.source.as_deref(),
+    )
+}
+
+fn snippet_content_fingerprint(
+    title: &str,
+    body: &str,
+    packages: &[String],
+    objects: &[String],
+    tags: &[String],
+    verbs: &[String],
+    source: Option<&str>,
+) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    title.hash(&mut hasher);
+    body.hash(&mut hasher);
+    packages.hash(&mut hasher);
+    objects.hash(&mut hasher);
+    tags.hash(&mut hasher);
+    verbs.hash(&mut hasher);
+    source.unwrap_or_default().hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 fn methods_across_response(generic: &str, packages: &[String]) -> Result<Value> {

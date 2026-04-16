@@ -19,7 +19,7 @@
 //! let stats = store.stats()?;
 //!
 //! if stats.indexed_packages > 0 {
-//!     let matches = store.search_package_documents("stats", "reshape", 5)?;
+//!     let matches = store.search_package_documents("stats", "reshape", 5, false)?;
 //!     for entry in matches {
 //!         println!("{}:{} {}", entry.kind, entry.key, entry.snippet);
 //!     }
@@ -38,7 +38,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const INDEX_SCHEMA_VERSION: i64 = 5;
+const INDEX_SCHEMA_VERSION: i64 = 6;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackageIndexState {
@@ -176,6 +176,7 @@ pub struct IndexedCallRef {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IndexedSnippet {
     pub id: i64,
+    pub key: String,
     pub title: String,
     pub body: String,
     pub packages: Vec<String>,
@@ -191,6 +192,7 @@ pub struct IndexedSnippet {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NewSnippet {
+    pub key: Option<String>,
     pub title: String,
     pub body: String,
     pub packages: Vec<String>,
@@ -810,15 +812,17 @@ impl IndexStore {
 
     pub fn add_snippet(&mut self, snippet: &NewSnippet) -> Result<IndexedSnippet> {
         let created_at = now_timestamp()?;
+        let snippet_key = snippet.key.clone().unwrap_or_else(generate_snippet_key);
         let tx = self
             .conn
             .transaction()
             .context("failed to start snippet transaction")?;
         tx.execute(
             "INSERT INTO snippets
-               (title, body, packages_json, objects_json, tags_json, verbs_json, status, source, package_versions_json, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+               (snippet_key, title, body, packages_json, objects_json, tags_json, verbs_json, status, source, package_versions_json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
+                snippet_key,
                 snippet.title,
                 snippet.body,
                 serde_json::to_string(&snippet.packages)?,
@@ -850,34 +854,49 @@ impl IndexStore {
     pub fn get_snippet(&self, id: i64) -> Result<Option<IndexedSnippet>> {
         self.conn
             .query_row(
-                "SELECT id, title, body, packages_json, objects_json, tags_json, verbs_json, status, source, package_versions_json, created_at, updated_at
+                "SELECT id, snippet_key, title, body, packages_json, objects_json, tags_json, verbs_json, status, source, package_versions_json, created_at, updated_at
                  FROM snippets
                  WHERE id = ?1",
                 [id],
                 |row| {
                     Ok(IndexedSnippet {
                         id: row.get(0)?,
-                        title: row.get(1)?,
-                        body: row.get(2)?,
-                        packages: serde_json::from_str(&row.get::<_, String>(3)?)
+                        key: row.get(1)?,
+                        title: row.get(2)?,
+                        body: row.get(3)?,
+                        packages: serde_json::from_str(&row.get::<_, String>(4)?)
                             .unwrap_or_default(),
-                        objects: serde_json::from_str(&row.get::<_, String>(4)?)
+                        objects: serde_json::from_str(&row.get::<_, String>(5)?)
                             .unwrap_or_default(),
-                        tags: serde_json::from_str(&row.get::<_, String>(5)?)
+                        tags: serde_json::from_str(&row.get::<_, String>(6)?)
                             .unwrap_or_default(),
-                        verbs: serde_json::from_str(&row.get::<_, String>(6)?)
+                        verbs: serde_json::from_str(&row.get::<_, String>(7)?)
                             .unwrap_or_default(),
-                        status: row.get(7)?,
-                        source: row.get(8)?,
-                        package_versions: serde_json::from_str(&row.get::<_, String>(9)?)
+                        status: row.get(8)?,
+                        source: row.get(9)?,
+                        package_versions: serde_json::from_str(&row.get::<_, String>(10)?)
                             .unwrap_or_default(),
-                        created_at: row.get(10)?,
-                        updated_at: row.get(11)?,
+                        created_at: row.get(11)?,
+                        updated_at: row.get(12)?,
                     })
                 },
             )
             .optional()
             .context("failed to load snippet")
+    }
+
+    pub fn get_snippet_by_key(&self, key: &str) -> Result<Option<IndexedSnippet>> {
+        self.conn
+            .query_row(
+                "SELECT id FROM snippets WHERE snippet_key = ?1",
+                [key],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .context("failed to query snippet by key")?
+            .map(|id| self.get_snippet(id))
+            .transpose()
+            .map(Option::flatten)
     }
 
     pub fn list_snippets(
@@ -890,7 +909,7 @@ impl IndexStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, title, body, packages_json, objects_json, tags_json, verbs_json, status, source, package_versions_json, created_at, updated_at
+                "SELECT id, snippet_key, title, body, packages_json, objects_json, tags_json, verbs_json, status, source, package_versions_json, created_at, updated_at
                  FROM snippets
                  ORDER BY updated_at DESC, id DESC",
             )
@@ -899,18 +918,19 @@ impl IndexStore {
             .query_map([], |row| {
                 Ok(IndexedSnippet {
                     id: row.get(0)?,
-                    title: row.get(1)?,
-                    body: row.get(2)?,
-                    packages: serde_json::from_str(&row.get::<_, String>(3)?).unwrap_or_default(),
-                    objects: serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default(),
-                    tags: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
-                    verbs: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
-                    status: row.get(7)?,
-                    source: row.get(8)?,
-                    package_versions: serde_json::from_str(&row.get::<_, String>(9)?)
+                    key: row.get(1)?,
+                    title: row.get(2)?,
+                    body: row.get(3)?,
+                    packages: serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default(),
+                    objects: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
+                    tags: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
+                    verbs: serde_json::from_str(&row.get::<_, String>(7)?).unwrap_or_default(),
+                    status: row.get(8)?,
+                    source: row.get(9)?,
+                    package_versions: serde_json::from_str(&row.get::<_, String>(10)?)
                         .unwrap_or_default(),
-                    created_at: row.get(10)?,
-                    updated_at: row.get(11)?,
+                    created_at: row.get(11)?,
+                    updated_at: row.get(12)?,
                 })
             })
             .context("failed to execute snippet listing query")?;
@@ -930,7 +950,11 @@ impl IndexStore {
         tag: Option<&str>,
         status: Option<&str>,
         limit: usize,
+        raw_match: bool,
     ) -> Result<Vec<IndexSearchMatch>> {
+        let Some(fts_query) = prepare_match_query(query, raw_match) else {
+            return Ok(Vec::new());
+        };
         let mut stmt = self
             .conn
             .prepare(
@@ -943,12 +967,12 @@ impl IndexStore {
             .context("failed to prepare snippet search")?;
         let fetch_limit = std::cmp::max(limit.saturating_mul(10), 50) as i64;
         let rows = stmt
-            .query_map(params![query, fetch_limit], |row| {
+            .query_map(params![fts_query, fetch_limit], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, Option<String>>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, f64>(3)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<f64>>(3)?,
                 ))
             })
             .context("failed to execute snippet search")?;
@@ -969,8 +993,8 @@ impl IndexStore {
                 kind: "snippet".to_string(),
                 key: doc_key,
                 title,
-                snippet,
-                score,
+                snippet: snippet.unwrap_or_else(|| snippet_row.title.clone()),
+                score: score.unwrap_or(0.0),
             });
             if matches.len() >= limit {
                 break;
@@ -1031,12 +1055,78 @@ impl IndexStore {
         self.get_snippet(id)
     }
 
+    pub fn update_snippet(
+        &mut self,
+        id: i64,
+        snippet: &NewSnippet,
+    ) -> Result<Option<IndexedSnippet>> {
+        let updated_at = now_timestamp()?;
+        let tx = self
+            .conn
+            .transaction()
+            .context("failed to start snippet update transaction")?;
+        let updated = tx
+            .execute(
+                "UPDATE snippets
+                 SET snippet_key = ?2,
+                     title = ?3,
+                     body = ?4,
+                     packages_json = ?5,
+                     objects_json = ?6,
+                     tags_json = ?7,
+                     verbs_json = ?8,
+                     status = ?9,
+                     source = ?10,
+                     package_versions_json = ?11,
+                     updated_at = ?12
+                 WHERE id = ?1",
+                params![
+                    id,
+                    snippet.key.clone().unwrap_or_else(generate_snippet_key),
+                    snippet.title,
+                    snippet.body,
+                    serde_json::to_string(&snippet.packages)?,
+                    serde_json::to_string(&snippet.objects)?,
+                    serde_json::to_string(&snippet.tags)?,
+                    serde_json::to_string(&snippet.verbs)?,
+                    snippet.status,
+                    snippet.source,
+                    serde_json::to_string(&snippet.package_versions)?,
+                    updated_at,
+                ],
+            )
+            .context("failed to update snippet")?;
+        if updated == 0 {
+            tx.commit()
+                .context("failed to commit empty snippet update transaction")?;
+            return Ok(None);
+        }
+        tx.execute(
+            "DELETE FROM search_documents WHERE kind = 'snippet' AND doc_key = ?1",
+            [id.to_string()],
+        )
+        .context("failed to delete prior snippet search row")?;
+        tx.execute(
+            "INSERT INTO search_documents (package, kind, doc_key, title, text)
+             VALUES ('', 'snippet', ?1, ?2, ?3)",
+            params![id.to_string(), snippet.title, snippet_search_text(snippet),],
+        )
+        .context("failed to persist updated snippet search row")?;
+        tx.commit()
+            .context("failed to commit snippet update transaction")?;
+        self.get_snippet(id)
+    }
+
     pub fn search_package_documents(
         &self,
         package: &str,
         query: &str,
         limit: usize,
+        raw_match: bool,
     ) -> Result<Vec<IndexSearchMatch>> {
+        let Some(fts_query) = prepare_match_query(query, raw_match) else {
+            return Ok(Vec::new());
+        };
         let mut stmt = self
             .conn
             .prepare(
@@ -1048,12 +1138,12 @@ impl IndexStore {
             )
             .context("failed to prepare package index search")?;
         let rows = stmt
-            .query_map(params![package, query, limit as i64], |row| {
+            .query_map(params![package, fts_query, limit as i64], |row| {
                 Ok(IndexSearchMatch {
                     kind: row.get(0)?,
                     key: row.get(1)?,
                     title: row.get(2)?,
-                    snippet: row.get(3)?,
+                    snippet: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
                     score: row.get(4)?,
                 })
             })
@@ -1161,6 +1251,7 @@ impl IndexStore {
 
                 CREATE TABLE IF NOT EXISTS snippets (
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  snippet_key TEXT NOT NULL UNIQUE,
                   title TEXT NOT NULL,
                   body TEXT NOT NULL,
                   packages_json TEXT NOT NULL,
@@ -1283,6 +1374,52 @@ fn join_searchable_text(parts: &[Option<&str>]) -> String {
         .join("\n\n")
 }
 
+pub fn prepare_match_query(query: &str, raw_match: bool) -> Option<String> {
+    if raw_match {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    } else {
+        build_safe_fts_query(query)
+    }
+}
+
+fn build_safe_fts_query(query: &str) -> Option<String> {
+    let tokens = tokenize_fts_query(query);
+    if tokens.is_empty() {
+        return None;
+    }
+
+    Some(
+        tokens
+            .into_iter()
+            .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" AND "),
+    )
+}
+
+fn tokenize_fts_query(query: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+
+    for ch in query.chars() {
+        if ch.is_alphanumeric() || ch == '_' {
+            current.push(ch);
+        } else if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    tokens
+}
+
 fn snippet_search_text(snippet: &NewSnippet) -> String {
     let mut chunks = vec![snippet.body.trim().to_string()];
     if !snippet.packages.is_empty() {
@@ -1302,6 +1439,18 @@ fn snippet_search_text(snippet: &NewSnippet) -> String {
         .filter(|chunk| !chunk.trim().is_empty())
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+fn generate_snippet_key() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("snip-{nanos:x}-{counter:x}")
 }
 
 fn snippet_matches_filters(
@@ -1844,7 +1993,7 @@ mod tests {
         assert_eq!(summary.files_count, 2);
 
         let matches = store
-            .search_package_documents("stats", "reshape", 10)
+            .search_package_documents("stats", "reshape", 10, false)
             .expect("search index");
         assert!(!matches.is_empty());
         assert!(matches.iter().any(|entry| entry.kind == "vignette"));
@@ -1914,6 +2063,7 @@ mod tests {
 
         let first = store
             .add_snippet(&NewSnippet {
+                key: None,
                 title: "BIDS workflow".to_string(),
                 body: "Use bidser to locate scans, then read them with neuroim2.".to_string(),
                 packages: vec!["bidser".to_string(), "neuroim2".to_string()],
@@ -1930,6 +2080,7 @@ mod tests {
             .expect("persist first snippet");
         let second = store
             .add_snippet(&NewSnippet {
+                key: None,
                 title: "Notes".to_string(),
                 body: "This workflow is mostly about loading BIDS-derived volumes.".to_string(),
                 packages: vec!["bidser".to_string()],
@@ -1949,7 +2100,14 @@ mod tests {
         assert!(listed.iter().any(|snippet| snippet.id == first.id));
 
         let matches = store
-            .search_snippets("workflow", Some("bidser"), Some("workflow"), None, 10)
+            .search_snippets(
+                "workflow",
+                Some("bidser"),
+                Some("workflow"),
+                None,
+                10,
+                false,
+            )
             .expect("search snippets");
         assert_eq!(
             matches.first().map(|entry| entry.key.clone()),
@@ -1973,6 +2131,7 @@ mod tests {
 
         let snippet = store
             .add_snippet(&NewSnippet {
+                key: None,
                 title: "Stats workflow".to_string(),
                 body: "Call lm.".to_string(),
                 packages: vec!["stats".to_string()],
@@ -1998,6 +2157,77 @@ mod tests {
         assert_eq!(
             refreshed.package_versions.get("stats").map(String::as_str),
             Some("2.0.0")
+        );
+    }
+
+    #[test]
+    fn update_snippet_rewrites_search_document() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let db_path = tempdir.path().join("index.sqlite3");
+        let mut store = IndexStore::open(&db_path).expect("open store");
+
+        let snippet = store
+            .add_snippet(&NewSnippet {
+                key: None,
+                title: "BIDS note".to_string(),
+                body: "Use bidser to find scans.".to_string(),
+                packages: vec!["bidser".to_string()],
+                objects: vec![],
+                tags: vec!["workflow".to_string()],
+                verbs: vec!["read".to_string()],
+                status: "verified".to_string(),
+                source: None,
+                package_versions: BTreeMap::from([("bidser".to_string(), "0.1.0".to_string())]),
+            })
+            .expect("persist snippet");
+
+        let edited = store
+            .update_snippet(
+                snippet.id,
+                &NewSnippet {
+                    key: Some(snippet.key.clone()),
+                    title: "Derivative note".to_string(),
+                    body: "Load derivative scans with neuroim2.".to_string(),
+                    packages: vec!["bidser".to_string(), "neuroim2".to_string()],
+                    objects: vec![],
+                    tags: vec!["bids".to_string()],
+                    verbs: vec!["load".to_string()],
+                    status: "verified".to_string(),
+                    source: None,
+                    package_versions: BTreeMap::from([
+                        ("bidser".to_string(), "0.1.0".to_string()),
+                        ("neuroim2".to_string(), "0.6.0".to_string()),
+                    ]),
+                },
+            )
+            .expect("update snippet")
+            .expect("missing updated snippet");
+        assert_eq!(edited.title, "Derivative note");
+
+        let matches = store
+            .search_snippets("derivative", None, Some("bids"), None, 10, false)
+            .expect("search updated snippets");
+        assert!(
+            matches
+                .iter()
+                .any(|entry| entry.key == snippet.id.to_string())
+        );
+    }
+
+    #[test]
+    fn safe_fts_query_normalizes_punctuation_heavy_input() {
+        assert_eq!(
+            prepare_match_query("pkg::fn-name", false),
+            Some("\"pkg\" AND \"fn\" AND \"name\"".to_string())
+        );
+        assert_eq!(
+            prepare_match_query("predict.lm", false),
+            Some("\"predict\" AND \"lm\"".to_string())
+        );
+        assert_eq!(prepare_match_query(":::---", false), None);
+        assert_eq!(
+            prepare_match_query("\"predict\" OR lm", true),
+            Some("\"predict\" OR lm".to_string())
         );
     }
 }

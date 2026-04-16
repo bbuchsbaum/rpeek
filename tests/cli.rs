@@ -315,7 +315,7 @@ fn index_status_reports_schema_and_path() {
 
     let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
     assert_eq!(value["command"], "index_status");
-    assert_eq!(value["payload"]["schema_version"], 5);
+    assert_eq!(value["payload"]["schema_version"], 6);
     assert!(value["payload"]["path"].as_str().is_some());
 }
 
@@ -380,6 +380,11 @@ fn snippet_commands_round_trip() {
     assert!(!matches.is_empty());
     assert_eq!(matches[0]["id"].as_i64(), Some(id));
     assert_eq!(matches[0]["effective_status"], "verified");
+    assert_eq!(
+        searched["payload"]["match_query"],
+        "\"bids\" AND \"workflow\""
+    );
+    assert_eq!(searched["payload"]["raw_match"], false);
 
     let (code, stdout) = run_with_socket(
         &socket,
@@ -401,6 +406,41 @@ fn snippet_commands_round_trip() {
         snippets
             .iter()
             .any(|entry| entry["id"].as_i64() == Some(id))
+    );
+
+    let (code, stdout) = run_with_socket(
+        &socket,
+        &[
+            "snippet",
+            "edit",
+            &id.to_string(),
+            "--title",
+            "Read preprocessed BIDS scan",
+            "--tag",
+            "bids",
+            "--body",
+            "Use bidser to find a derivative scan, then load it with neuroim2.",
+        ],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let edited: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(edited["command"], "snippet_edit");
+    assert_eq!(edited["payload"]["title"], "Read preprocessed BIDS scan");
+
+    let (code, stdout) = run_with_socket(
+        &socket,
+        &["snippet", "search", "derivative scan", "--tag", "bids"],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let searched: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    let matches = searched["payload"]["matches"]
+        .as_array()
+        .expect("missing matches");
+    assert!(!matches.is_empty());
+    assert_eq!(matches[0]["id"].as_i64(), Some(id));
+    assert_eq!(
+        searched["payload"]["match_query"],
+        "\"derivative\" AND \"scan\""
     );
 
     let (code, stdout) = run_with_socket(&socket, &["snippet", "delete", &id.to_string()]);
@@ -462,7 +502,13 @@ fn snippet_show_marks_version_mismatches_as_stale() {
 
     let (code, stdout) = run_with_socket(
         &socket,
-        &["snippet", "refresh", &id.to_string(), "--status", "verified"],
+        &[
+            "snippet",
+            "refresh",
+            &id.to_string(),
+            "--status",
+            "verified",
+        ],
     );
     assert_eq!(code, 0, "stdout: {stdout}");
     let refreshed: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
@@ -476,6 +522,145 @@ fn snippet_show_marks_version_mismatches_as_stale() {
             .len(),
         0
     );
+}
+
+#[test]
+fn snippet_export_import_round_trips_between_indexes() {
+    let tempdir = TempDir::new().expect("failed to create tempdir");
+    let export_path = tempdir.path().join("snippets.json");
+    let machine_a = tempdir.path().join("machine-a");
+    let machine_b = tempdir.path().join("machine-b");
+    fs::create_dir_all(&machine_a).expect("create machine-a dir");
+    fs::create_dir_all(&machine_b).expect("create machine-b dir");
+
+    let socket_a = machine_a.join("rpeek-snippet-export-a.sock");
+    let _guard_a = DaemonGuard {
+        socket: socket_a.clone(),
+    };
+    let (code, stdout) = run_with_socket(
+        &socket_a,
+        &[
+            "snippet",
+            "add",
+            "--title",
+            "Cross-machine note",
+            "--package",
+            "stats",
+            "--tag",
+            "workflow",
+            "--body",
+            "Call lm on the new machine too.",
+        ],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let (code, stdout) = run_with_socket(
+        &socket_a,
+        &[
+            "snippet",
+            "export",
+            "--all",
+            "--file",
+            export_path.to_str().expect("utf8 export path"),
+        ],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let exported: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(exported["command"], "snippet_export");
+    assert_eq!(exported["payload"]["count"], 1);
+    assert!(export_path.exists());
+
+    let socket_b = machine_b.join("rpeek-snippet-export-b.sock");
+    let _guard_b = DaemonGuard {
+        socket: socket_b.clone(),
+    };
+    let (code, stdout) = run_with_socket(
+        &socket_b,
+        &[
+            "snippet",
+            "import",
+            "--file",
+            export_path.to_str().expect("utf8 export path"),
+        ],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let imported: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(imported["command"], "snippet_import");
+    assert_eq!(imported["payload"]["count"], 1);
+    assert_eq!(imported["payload"]["inserted"], 1);
+    assert_eq!(imported["payload"]["merged"], 0);
+
+    let (code, stdout) = run_with_socket(&socket_b, &["snippet", "search", "cross-machine"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let searched: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    let matches = searched["payload"]["matches"]
+        .as_array()
+        .expect("missing matches");
+    assert!(!matches.is_empty());
+    assert_eq!(matches[0]["title"], "Cross-machine note");
+    assert_eq!(
+        searched["payload"]["match_query"],
+        "\"cross\" AND \"machine\""
+    );
+
+    let (code, stdout) = run_with_socket(
+        &socket_b,
+        &[
+            "snippet",
+            "import",
+            "--file",
+            export_path.to_str().expect("utf8 export path"),
+        ],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let imported_again: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(imported_again["payload"]["count"], 1);
+    assert_eq!(imported_again["payload"]["inserted"], 0);
+    assert_eq!(imported_again["payload"]["merged"], 1);
+
+    let (code, stdout) = run_with_socket(&socket_b, &["snippet", "list"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let listed: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    let snippets = listed["payload"]["snippets"]
+        .as_array()
+        .expect("missing snippets");
+    assert_eq!(snippets.len(), 1);
+}
+
+#[test]
+fn snippet_search_can_use_raw_match() {
+    let tempdir = TempDir::new().expect("failed to create tempdir");
+    let socket = tempdir.path().join("rpeek-snippet-raw.sock");
+    let _guard = DaemonGuard {
+        socket: socket.clone(),
+    };
+    let (code, stdout) = run_with_socket(
+        &socket,
+        &[
+            "snippet",
+            "add",
+            "--title",
+            "Predict note",
+            "--tag",
+            "workflow",
+            "--body",
+            "Use predict.lm on a fitted model.",
+        ],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let (code, stdout) = run_with_socket(
+        &socket,
+        &["snippet", "search", "\"predict\" OR lm", "--raw-match"],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let searched: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(searched["payload"]["raw_match"], true);
+    assert_eq!(searched["payload"]["match_query"], "\"predict\" OR lm");
+    let matches = searched["payload"]["matches"]
+        .as_array()
+        .expect("missing matches");
+    assert!(!matches.is_empty());
 }
 
 #[test]
@@ -534,6 +719,7 @@ fn index_package_builds_queryable_package_bundle() {
     assert_eq!(code, 0, "stdout: {stdout}");
     let searched: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
     assert_eq!(searched["command"], "index_search");
+    assert_eq!(searched["payload"]["match_query"], "\"reshape\"");
     let matches = searched["payload"]["matches"]
         .as_array()
         .expect("missing matches");

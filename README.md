@@ -184,7 +184,11 @@ rpeek bridge stats graphics
 rpeek xref stats lm
 rpeek used-by graphics plot
 rpeek snippet add --title "Read BIDS preproc scan" --package bidser --package neuroim2 --tag workflow --body "Use bidser to locate scans, then read them with neuroim2."
+rpeek snippet edit 1 --title "Read derivative BIDS scan" --tag bids --body "Use bidser to find a derivative scan, then load it with neuroim2."
+rpeek snippet export --all --file snippets.json
+rpeek snippet import --file snippets.json
 rpeek snippet search "bids workflow"
+rpeek snippet refresh 1 --status verified
 rpeek search-all --kind object --limit 10 lm
 rpeek sigs stats
 rpeek vignettes stats
@@ -211,7 +215,11 @@ cargo run -- bridge stats graphics
 cargo run -- xref stats lm
 cargo run -- used-by graphics plot
 cargo run -- snippet add --title "Read BIDS preproc scan" --package bidser --package neuroim2 --tag workflow --body "Use bidser to locate scans, then read them with neuroim2."
+cargo run -- snippet edit 1 --title "Read derivative BIDS scan" --tag bids --body "Use bidser to find a derivative scan, then load it with neuroim2."
+cargo run -- snippet export --all --file snippets.json
+cargo run -- snippet import --file snippets.json
 cargo run -- snippet search "bids workflow"
+cargo run -- snippet refresh 1 --status verified
 cargo run -- search-all --kind object --limit 10 lm
 cargo run -- sigs stats
 cargo run -- vignettes stats
@@ -404,10 +412,16 @@ target/debug/rpeek index status
 target/debug/rpeek index package stats
 target/debug/rpeek index show stats
 target/debug/rpeek index search stats reshape
+target/debug/rpeek index search stats '"predict" OR lm' --raw-match
 target/debug/rpeek index clear
 target/debug/rpeek snippet add --title "Read BIDS preproc scan" --package bidser --package neuroim2 --tag workflow --status verified --body "Use bidser to locate scans, then read them with neuroim2."
+target/debug/rpeek snippet edit 1 --title "Read derivative BIDS scan" --tag bids --body "Use bidser to find a derivative scan, then load it with neuroim2."
+target/debug/rpeek snippet export --all --file snippets.json
+target/debug/rpeek snippet import --file snippets.json
 target/debug/rpeek snippet search "bids workflow"
+target/debug/rpeek snippet search '"predict" OR lm' --raw-match
 target/debug/rpeek snippet list --package bidser
+target/debug/rpeek snippet refresh 1 --status verified
 ```
 
 Inspect, stop, or restart a daemon bound to an explicit socket:
@@ -432,9 +446,19 @@ The persistent index path defaults to `~/.cache/rpeek/index.sqlite3` (or `XDG_CA
 
 Package-scoped metadata and search commands such as `pkg`, `exports`, `objects`, `search`, `sigs`, `vignettes`, `vignette`, and `search-vignettes` will lazily build or refresh that package index on first access when you are using the daemon-backed CLI path.
 
-`snippet add`, `snippet list`, `snippet show`, `snippet search`, and `snippet delete` use the same SQLite store for local workflow notes. Snippets keep package names, tags, verbs, a status field (`unknown`, `verified`, `stale`, `failed`), and the package versions known at insert time.
+`snippet add`, `snippet list`, `snippet show`, `snippet edit`, `snippet export`, `snippet import`, `snippet search`, `snippet refresh`, and `snippet delete` use the same SQLite store for local workflow notes. Snippets keep package names, tags, verbs, a status field (`unknown`, `verified`, `stale`, `failed`), and the package versions known at insert time.
 
 When you retrieve snippets, `rpeek` now reports both the stored `status` and an `effective_status`. If a referenced package version in the index no longer matches the version captured when the snippet was added, `effective_status` becomes `stale` and the payload includes `stale_packages` with recorded vs current versions.
+
+Use `snippet edit <id>` for in-place updates to title, body, tags, objects, verbs, or package associations. Edits also rewrite the snippet’s FTS search row and recompute recorded package versions for the final package set.
+
+Use `snippet export` and `snippet import` to move workflow notes between machines. Export bundles now carry a stable snippet key, and import will merge on that key instead of blindly inserting duplicates. For older bundles without keys, import falls back to a content fingerprint. The JSON bundle keeps the original recorded package-version snapshot, so an imported snippet can still show up as `effective_status: "stale"` if the target machine has different package versions.
+
+Use `snippet refresh <id>` to rewrite the recorded package versions from the current index. Add `--status verified` when you want the stored status reset after you have re-checked the workflow.
+
+Indexed FTS search now normalizes punctuation-heavy queries before they reach SQLite `MATCH`. Inputs like `pkg::fn`, `predict.lm`, or `cross-machine` are tokenized into safe lexical queries instead of relying on raw FTS syntax.
+
+For debugging, indexed search payloads now include `match_query`, the exact expression sent to SQLite. If you really do want native FTS syntax, use `--raw-match` with `index search` or `snippet search`.
 
 ## Performance
 
