@@ -997,6 +997,40 @@ impl IndexStore {
         Ok(deleted > 0)
     }
 
+    pub fn refresh_snippet(
+        &mut self,
+        id: i64,
+        package_versions: &BTreeMap<String, String>,
+        status: Option<&str>,
+    ) -> Result<Option<IndexedSnippet>> {
+        let updated_at = now_timestamp()?;
+        let tx = self
+            .conn
+            .transaction()
+            .context("failed to start snippet refresh transaction")?;
+        let updated = tx
+            .execute(
+                "UPDATE snippets
+                 SET package_versions_json = ?2,
+                     status = COALESCE(?3, status),
+                     updated_at = ?4
+                 WHERE id = ?1",
+                params![
+                    id,
+                    serde_json::to_string(package_versions)?,
+                    status,
+                    updated_at,
+                ],
+            )
+            .context("failed to refresh snippet")?;
+        tx.commit()
+            .context("failed to commit snippet refresh transaction")?;
+        if updated == 0 {
+            return Ok(None);
+        }
+        self.get_snippet(id)
+    }
+
     pub fn search_package_documents(
         &self,
         package: &str,
@@ -1929,5 +1963,41 @@ mod tests {
 
         assert!(store.delete_snippet(first.id).expect("delete snippet"));
         assert!(store.get_snippet(first.id).expect("load deleted").is_none());
+    }
+
+    #[test]
+    fn refresh_snippet_updates_versions_and_status() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let db_path = tempdir.path().join("index.sqlite3");
+        let mut store = IndexStore::open(&db_path).expect("open store");
+
+        let snippet = store
+            .add_snippet(&NewSnippet {
+                title: "Stats workflow".to_string(),
+                body: "Call lm.".to_string(),
+                packages: vec!["stats".to_string()],
+                objects: vec![],
+                tags: vec!["workflow".to_string()],
+                verbs: vec!["fit".to_string()],
+                status: "stale".to_string(),
+                source: None,
+                package_versions: BTreeMap::from([("stats".to_string(), "1.0.0".to_string())]),
+            })
+            .expect("persist snippet");
+
+        let refreshed = store
+            .refresh_snippet(
+                snippet.id,
+                &BTreeMap::from([("stats".to_string(), "2.0.0".to_string())]),
+                Some("verified"),
+            )
+            .expect("refresh snippet")
+            .expect("missing refreshed snippet");
+
+        assert_eq!(refreshed.status, "verified");
+        assert_eq!(
+            refreshed.package_versions.get("stats").map(String::as_str),
+            Some("2.0.0")
+        );
     }
 }

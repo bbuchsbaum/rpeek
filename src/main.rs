@@ -280,6 +280,12 @@ enum SnippetCommands {
     },
     #[command(about = "Show one stored snippet")]
     Show { id: i64 },
+    #[command(about = "Refresh recorded package versions for one snippet")]
+    Refresh {
+        id: i64,
+        #[arg(long, value_enum)]
+        status: Option<SnippetStatusArg>,
+    },
     #[command(about = "Search stored snippets with bm25-ranked FTS")]
     Search {
         query: String,
@@ -1476,6 +1482,9 @@ fn snippet_response(command: SnippetCommands) -> Result<Value> {
             limit,
         ),
         SnippetCommands::Show { id } => snippet_show_response(id),
+        SnippetCommands::Refresh { id, status } => {
+            snippet_refresh_response(id, status.map(SnippetStatusArg::as_str))
+        }
         SnippetCommands::Search {
             query,
             package,
@@ -1518,12 +1527,14 @@ fn snippet_add_response(
         source,
         package_versions,
     })?;
+    let current_versions = current_package_versions_for_snippets(std::slice::from_ref(&snippet))?;
+    let evaluation = evaluate_snippet_status(&snippet, &current_versions);
 
     Ok(json!({
         "schema_version": 1,
         "ok": true,
         "command": "snippet_add",
-        "payload": snippet_json(&snippet),
+        "payload": snippet_json(&snippet, &evaluation),
     }))
 }
 
@@ -1535,9 +1546,13 @@ fn snippet_list_response(
 ) -> Result<Value> {
     let store = IndexStore::open_default()?;
     let snippets = store.list_snippets(package, tag, status, limit)?;
+    let current_versions = current_package_versions_for_snippets(&snippets)?;
     let items = snippets
         .iter()
-        .map(snippet_summary_json)
+        .map(|snippet| {
+            let evaluation = evaluate_snippet_status(snippet, &current_versions);
+            snippet_summary_json(snippet, &evaluation)
+        })
         .collect::<Vec<_>>();
     Ok(json!({
         "schema_version": 1,
@@ -1560,11 +1575,33 @@ fn snippet_show_response(id: i64) -> Result<Value> {
     let snippet = store
         .get_snippet(id)?
         .ok_or_else(|| anyhow!("snippet '{id}' was not found"))?;
+    let current_versions = current_package_versions_for_snippets(std::slice::from_ref(&snippet))?;
+    let evaluation = evaluate_snippet_status(&snippet, &current_versions);
     Ok(json!({
         "schema_version": 1,
         "ok": true,
         "command": "snippet_show",
-        "payload": snippet_json(&snippet),
+        "payload": snippet_json(&snippet, &evaluation),
+    }))
+}
+
+fn snippet_refresh_response(id: i64, status: Option<&str>) -> Result<Value> {
+    let mut store = IndexStore::open_default()?;
+    let snippet = store
+        .get_snippet(id)?
+        .ok_or_else(|| anyhow!("snippet '{id}' was not found"))?;
+    let package_versions = indexed_package_versions(&snippet.packages)?;
+    let refreshed = store
+        .refresh_snippet(id, &package_versions, status)?
+        .ok_or_else(|| anyhow!("snippet '{id}' disappeared during refresh"))?;
+    let current_versions = current_package_versions_for_snippets(std::slice::from_ref(&refreshed))?;
+    let evaluation = evaluate_snippet_status(&refreshed, &current_versions);
+
+    Ok(json!({
+        "schema_version": 1,
+        "ok": true,
+        "command": "snippet_refresh",
+        "payload": snippet_json(&refreshed, &evaluation),
     }))
 }
 
@@ -1577,15 +1614,28 @@ fn snippet_search_response(
 ) -> Result<Value> {
     let store = IndexStore::open_default()?;
     let matches = store.search_snippets(query, package, tag, status, limit)?;
+    let snippet_rows = matches
+        .iter()
+        .filter_map(|entry| entry.key.parse::<i64>().ok())
+        .filter_map(|id| store.get_snippet(id).ok().flatten())
+        .collect::<Vec<_>>();
+    let current_versions = current_package_versions_for_snippets(&snippet_rows)?;
+    let snippets_by_id = snippet_rows
+        .into_iter()
+        .map(|snippet| (snippet.id, snippet))
+        .collect::<HashMap<_, _>>();
     let results = matches
         .into_iter()
         .filter_map(|entry| {
             let id = entry.key.parse::<i64>().ok()?;
-            let snippet = store.get_snippet(id).ok()??;
+            let snippet = snippets_by_id.get(&id)?;
+            let evaluation = evaluate_snippet_status(snippet, &current_versions);
             Some(json!({
                 "id": id,
                 "title": snippet.title,
                 "status": snippet.status,
+                "effective_status": evaluation.effective_status,
+                "stale_packages": stale_packages_json(&evaluation.stale_packages),
                 "packages": snippet.packages,
                 "tags": snippet.tags,
                 "score": entry.score,
@@ -1645,10 +1695,69 @@ fn snippet_body_input(file: Option<&Path>, body: Option<&str>) -> Result<String>
     Ok(trimmed.to_string())
 }
 
-fn indexed_package_versions(
-    packages: &[String],
-) -> Result<std::collections::BTreeMap<String, String>> {
-    let mut versions = std::collections::BTreeMap::new();
+fn indexed_package_versions(packages: &[String]) -> Result<BTreeMap<String, String>> {
+    collect_current_package_versions(packages)
+}
+
+fn snippet_json(snippet: &IndexedSnippet, evaluation: &SnippetStatusEvaluation) -> Value {
+    json!({
+        "id": snippet.id,
+        "title": snippet.title,
+        "body": snippet.body,
+        "packages": snippet.packages,
+        "objects": snippet.objects,
+        "tags": snippet.tags,
+        "verbs": snippet.verbs,
+        "status": snippet.status,
+        "effective_status": evaluation.effective_status,
+        "source": snippet.source,
+        "package_versions": snippet.package_versions,
+        "current_package_versions": evaluation.current_package_versions,
+        "stale_packages": stale_packages_json(&evaluation.stale_packages),
+        "created_at": snippet.created_at,
+        "updated_at": snippet.updated_at,
+    })
+}
+
+fn snippet_summary_json(snippet: &IndexedSnippet, evaluation: &SnippetStatusEvaluation) -> Value {
+    json!({
+        "id": snippet.id,
+        "title": snippet.title,
+        "status": snippet.status,
+        "effective_status": evaluation.effective_status,
+        "packages": snippet.packages,
+        "tags": snippet.tags,
+        "verbs": snippet.verbs,
+        "stale_packages": stale_packages_json(&evaluation.stale_packages),
+        "updated_at": snippet.updated_at,
+        "body_preview": first_text_line(&snippet.body),
+    })
+}
+
+fn first_text_line(text: &str) -> String {
+    text.lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .take(160)
+        .collect()
+}
+
+fn current_package_versions_for_snippets(
+    snippets: &[IndexedSnippet],
+) -> Result<BTreeMap<String, String>> {
+    let packages = snippets
+        .iter()
+        .flat_map(|snippet| snippet.packages.iter().cloned())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    collect_current_package_versions(&packages)
+}
+
+fn collect_current_package_versions(packages: &[String]) -> Result<BTreeMap<String, String>> {
+    let mut versions = BTreeMap::new();
     if packages.is_empty() {
         return Ok(versions);
     }
@@ -1664,43 +1773,57 @@ fn indexed_package_versions(
     Ok(versions)
 }
 
-fn snippet_json(snippet: &IndexedSnippet) -> Value {
-    json!({
-        "id": snippet.id,
-        "title": snippet.title,
-        "body": snippet.body,
-        "packages": snippet.packages,
-        "objects": snippet.objects,
-        "tags": snippet.tags,
-        "verbs": snippet.verbs,
-        "status": snippet.status,
-        "source": snippet.source,
-        "package_versions": snippet.package_versions,
-        "created_at": snippet.created_at,
-        "updated_at": snippet.updated_at,
-    })
+fn evaluate_snippet_status(
+    snippet: &IndexedSnippet,
+    current_versions: &BTreeMap<String, String>,
+) -> SnippetStatusEvaluation {
+    let mut stale_packages = Vec::new();
+    let mut snapshot = BTreeMap::new();
+
+    for package in &snippet.packages {
+        let recorded_version = snippet.package_versions.get(package).cloned();
+        let current_version = current_versions.get(package).cloned();
+        if let Some(current_version) = &current_version {
+            snapshot.insert(package.clone(), current_version.clone());
+        }
+
+        if recorded_version.is_some()
+            && current_version.is_some()
+            && recorded_version != current_version
+        {
+            stale_packages.push(StalePackageInfo {
+                package: package.clone(),
+                recorded_version,
+                current_version,
+            });
+        }
+    }
+
+    let effective_status = if snippet.status == "failed" {
+        "failed".to_string()
+    } else if snippet.status == "stale" || !stale_packages.is_empty() {
+        "stale".to_string()
+    } else {
+        snippet.status.clone()
+    };
+
+    SnippetStatusEvaluation {
+        effective_status,
+        stale_packages,
+        current_package_versions: snapshot,
+    }
 }
 
-fn snippet_summary_json(snippet: &IndexedSnippet) -> Value {
-    json!({
-        "id": snippet.id,
-        "title": snippet.title,
-        "status": snippet.status,
-        "packages": snippet.packages,
-        "tags": snippet.tags,
-        "verbs": snippet.verbs,
-        "updated_at": snippet.updated_at,
-        "body_preview": first_text_line(&snippet.body),
-    })
-}
-
-fn first_text_line(text: &str) -> String {
-    text.lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or_default()
-        .trim()
-        .chars()
-        .take(160)
+fn stale_packages_json(stale_packages: &[StalePackageInfo]) -> Vec<Value> {
+    stale_packages
+        .iter()
+        .map(|entry| {
+            json!({
+                "package": entry.package,
+                "recorded_version": entry.recorded_version,
+                "current_version": entry.current_version,
+            })
+        })
         .collect()
 }
 

@@ -1,3 +1,4 @@
+use rusqlite::Connection;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -357,6 +358,7 @@ fn snippet_commands_round_trip() {
     let shown: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
     assert_eq!(shown["payload"]["title"], "Read BIDS preproc scan");
     assert_eq!(shown["payload"]["status"], "verified");
+    assert_eq!(shown["payload"]["effective_status"], "verified");
 
     let (code, stdout) = run_with_socket(
         &socket,
@@ -377,6 +379,7 @@ fn snippet_commands_round_trip() {
         .expect("missing matches");
     assert!(!matches.is_empty());
     assert_eq!(matches[0]["id"].as_i64(), Some(id));
+    assert_eq!(matches[0]["effective_status"], "verified");
 
     let (code, stdout) = run_with_socket(
         &socket,
@@ -404,6 +407,75 @@ fn snippet_commands_round_trip() {
     assert_eq!(code, 0, "stdout: {stdout}");
     let deleted: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
     assert_eq!(deleted["payload"]["deleted"], true);
+}
+
+#[test]
+fn snippet_show_marks_version_mismatches_as_stale() {
+    let tempdir = TempDir::new().expect("failed to create tempdir");
+    let socket = tempdir.path().join("rpeek-snippet-stale.sock");
+    let _guard = DaemonGuard {
+        socket: socket.clone(),
+    };
+    let index_path = socket
+        .parent()
+        .expect("socket should have parent")
+        .join("rpeek-index.sqlite3");
+
+    let (code, stdout) = run_with_socket(
+        &socket,
+        &[
+            "snippet",
+            "add",
+            "--title",
+            "Stats note",
+            "--package",
+            "stats",
+            "--status",
+            "verified",
+            "--body",
+            "Call lm for a quick linear model.",
+        ],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let added: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    let id = added["payload"]["id"].as_i64().expect("missing snippet id");
+
+    let conn = Connection::open(&index_path).expect("open index db");
+    conn.execute(
+        "UPDATE package_records SET version = '999.0.0' WHERE package = 'stats'",
+        [],
+    )
+    .expect("update package version");
+
+    let (code, stdout) = run_with_socket(&socket, &["snippet", "show", &id.to_string()]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let shown: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(shown["payload"]["status"], "verified");
+    assert_eq!(shown["payload"]["effective_status"], "stale");
+    let stale_packages = shown["payload"]["stale_packages"]
+        .as_array()
+        .expect("missing stale package list");
+    assert_eq!(stale_packages.len(), 1);
+    assert_eq!(stale_packages[0]["package"], "stats");
+    assert!(stale_packages[0]["recorded_version"].as_str().is_some());
+    assert_eq!(stale_packages[0]["current_version"], "999.0.0");
+
+    let (code, stdout) = run_with_socket(
+        &socket,
+        &["snippet", "refresh", &id.to_string(), "--status", "verified"],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let refreshed: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(refreshed["command"], "snippet_refresh");
+    assert_eq!(refreshed["payload"]["status"], "verified");
+    assert_eq!(refreshed["payload"]["effective_status"], "verified");
+    assert_eq!(
+        refreshed["payload"]["stale_packages"]
+            .as_array()
+            .expect("missing stale package list")
+            .len(),
+        0
+    );
 }
 
 #[test]

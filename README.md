@@ -432,7 +432,9 @@ The persistent index path defaults to `~/.cache/rpeek/index.sqlite3` (or `XDG_CA
 
 Package-scoped metadata and search commands such as `pkg`, `exports`, `objects`, `search`, `sigs`, `vignettes`, `vignette`, and `search-vignettes` will lazily build or refresh that package index on first access when you are using the daemon-backed CLI path.
 
-`snippet add`, `snippet list`, `snippet show`, `snippet search`, and `snippet delete` use the same SQLite store for local workflow notes. Snippets keep package names, tags, verbs, a status field (`unknown`, `verified`, `stale`, `failed`), and the package versions known at insert time so stale workflow notes are easier to spot later.
+`snippet add`, `snippet list`, `snippet show`, `snippet search`, and `snippet delete` use the same SQLite store for local workflow notes. Snippets keep package names, tags, verbs, a status field (`unknown`, `verified`, `stale`, `failed`), and the package versions known at insert time.
+
+When you retrieve snippets, `rpeek` now reports both the stored `status` and an `effective_status`. If a referenced package version in the index no longer matches the version captured when the snippet was added, `effective_status` becomes `stale` and the payload includes `stale_packages` with recorded vs current versions.
 
 ## Performance
 
