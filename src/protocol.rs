@@ -91,6 +91,18 @@ pub enum Request {
         /// Object name.
         name: String,
     },
+    /// Return a one-shot package orientation map for agents.
+    Map {
+        /// Installed R package name.
+        package: String,
+    },
+    /// Return function signatures for one package.
+    Sigs {
+        /// Installed R package name.
+        package: String,
+        /// Whether to include all namespace objects instead of exports only.
+        all_objects: bool,
+    },
     /// Return best-effort source for one object.
     Source {
         /// Installed R package name.
@@ -105,12 +117,38 @@ pub enum Request {
         /// Help topic name.
         topic: String,
     },
+    /// Return installed help topic names.
+    Topics {
+        /// Installed R package name.
+        package: String,
+    },
     /// Return related S3/S4 methods.
     Methods {
         /// Installed R package name.
         package: String,
         /// Generic/object name.
         name: String,
+    },
+    /// Return installed package vignette metadata.
+    Vignettes {
+        /// Installed R package name.
+        package: String,
+    },
+    /// Return installed vignette text and metadata.
+    Vignette {
+        /// Installed R package name.
+        package: String,
+        /// Vignette name/topic.
+        name: String,
+    },
+    /// Search installed vignette titles and text.
+    SearchVignettes {
+        /// Installed R package name.
+        package: String,
+        /// Search query.
+        query: String,
+        /// Maximum matches to return.
+        limit: usize,
     },
     /// Return installed package files.
     Files {
@@ -153,9 +191,15 @@ impl Request {
             Self::Resolve { .. } => "resolve",
             Self::Summary { .. } => "summary",
             Self::Sig { .. } => "sig",
+            Self::Map { .. } => "map",
+            Self::Sigs { .. } => "sigs",
             Self::Source { .. } => "source",
             Self::Doc { .. } => "doc",
+            Self::Topics { .. } => "topics",
             Self::Methods { .. } => "methods",
+            Self::Vignettes { .. } => "vignettes",
+            Self::Vignette { .. } => "vignette",
+            Self::SearchVignettes { .. } => "search_vignettes",
             Self::Files { .. } => "files",
             Self::Grep { .. } => "grep",
             Self::CacheClear => "cache_clear",
@@ -175,9 +219,15 @@ impl Request {
             | Self::Search { package, .. }
             | Self::Summary { package, .. }
             | Self::Sig { package, .. }
+            | Self::Map { package }
+            | Self::Sigs { package, .. }
             | Self::Source { package, .. }
             | Self::Doc { package, .. }
+            | Self::Topics { package }
             | Self::Methods { package, .. }
+            | Self::Vignettes { package }
+            | Self::Vignette { package, .. }
+            | Self::SearchVignettes { package, .. }
             | Self::Files { package }
             | Self::Grep { package, .. } => Some(package),
             Self::Resolve { package, .. } => package.as_deref(),
@@ -189,7 +239,11 @@ impl Request {
     pub fn can_run_without_daemon(&self) -> bool {
         !matches!(
             self,
-            Self::CacheClear | Self::CacheStats | Self::DaemonStatus | Self::Shutdown
+            Self::Map { .. }
+                | Self::CacheClear
+                | Self::CacheStats
+                | Self::DaemonStatus
+                | Self::Shutdown
         )
     }
 
@@ -221,6 +275,26 @@ impl Request {
                 | Self::Resolve { package: None, .. }
         )
     }
+
+    /// Whether this request can be served from the persistent package index.
+    pub fn can_use_index(&self) -> bool {
+        matches!(
+            self,
+            Self::Pkg { .. }
+                | Self::Exports { .. }
+                | Self::Objects { .. }
+                | Self::Search { .. }
+                | Self::Map { .. }
+                | Self::Sigs {
+                    all_objects: false,
+                    ..
+                }
+                | Self::Topics { .. }
+                | Self::Vignettes { .. }
+                | Self::Vignette { .. }
+                | Self::SearchVignettes { .. }
+        )
+    }
 }
 
 #[cfg(test)]
@@ -249,5 +323,18 @@ mod tests {
 
         assert!(!request.requires_package());
         assert!(!request.is_cacheable());
+    }
+
+    #[test]
+    fn sigs_request_is_cacheable_and_package_scoped() {
+        let request = Request::Sigs {
+            package: "stats".to_string(),
+            all_objects: false,
+        };
+
+        assert_eq!(request.action(), "sigs");
+        assert_eq!(request.package(), Some("stats"));
+        assert!(request.requires_package());
+        assert!(request.is_cacheable());
     }
 }

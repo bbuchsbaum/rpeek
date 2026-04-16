@@ -21,6 +21,27 @@ Installed R packages are awkward to inspect programmatically:
 
 The helper process requires the R package `jsonlite` for robust request/response encoding.
 
+## Agent Snippet
+
+Paste this into an agent prompt when you want it to use `rpeek` effectively:
+
+```text
+Use `rpeek` to inspect installed R packages quickly.
+
+- Start with `rpeek map <package>` for a one-shot package orientation pass. Use `rpeek pkg <package>` and `rpeek exports <package>` when you want the raw metadata and export list separately.
+- If you only know part of a name, use `rpeek search <package> <query>` or `rpeek search-all <query>`.
+- For many functions at once, use `rpeek sigs <package>`. Add `--all-objects` for non-exported namespace functions.
+- For one object, use `rpeek summary <package> <name>` first, then drill into `rpeek sig`, `rpeek source`, `rpeek doc`, and `rpeek methods`.
+- For cross-package work, use `rpeek methods-across <generic> --package <pkg>...` and `rpeek bridge <package> <other-package>`.
+- For symbol-level tracing, use `rpeek xref <package> <symbol>` and `rpeek used-by <package> <symbol>`.
+- Use `rpeek vignettes <package>`, `rpeek vignette <package> <name>`, and `rpeek search-vignettes <package> <query>` for installed vignette discovery.
+- Use `rpeek grep <package> <query>` to search installed package files when docs or deparsed source are not enough.
+- If you will query the same package repeatedly, pre-index it with `rpeek index package <package>`, then use `rpeek index show <package>` and `rpeek index search <package> <query>`.
+- Store local workflow knowledge with `rpeek snippet add`, then retrieve it later with `rpeek snippet search` or `rpeek snippet list`.
+- Output is JSON by default. Parse fields from the JSON instead of scraping prose.
+- Use `--max-bytes` and `--no-examples` to keep payloads compact when needed.
+```
+
 ## Platform Support
 
 `rpeek` currently targets Unix-like systems: macOS and Linux. It uses Unix domain sockets for the local daemon, so Windows is not supported yet unless run inside a Unix-like environment such as WSL.
@@ -126,6 +147,7 @@ RPEEK_R_COMMAND=/full/path/to/R rpeek doctor
 ## What It Can Do
 
 - package metadata and install location
+- one-shot package orientation map for agents
 - exported symbols
 - full namespace object listing
 - substring search across objects and help topics
@@ -136,9 +158,18 @@ RPEEK_R_COMMAND=/full/path/to/R rpeek doctor
 - package-wide function signature listing
 - best-effort source retrieval
 - installed help / roxygen-derived docs
+- installed vignette listing, reading, and search
 - S3 and S4 method discovery
+- cross-package method lookup across indexed packages
+- package-to-package dependency and overlap summaries
+- best-effort symbol xref and caller lookup from indexed files
 - installed file listing
 - daemon-local caching with stats and reset commands
+- persistent index storage for package metadata, docs, vignettes, examples, and file text
+- indexed workflow snippets with status and package-version metadata
+- lazy index-backed routing for fast package metadata and package-scoped search commands
+- bm25-ranked FTS search for indexed package docs and snippets
+- manual warm-path benchmark harness with latency targets
 - batch execution for multiple agent requests in one process
 
 ## Quick Start
@@ -147,8 +178,17 @@ If you installed with `cargo install`, run commands directly:
 
 ```bash
 rpeek search stats lm
+rpeek map stats
+rpeek methods-across plot --package stats --package graphics
+rpeek bridge stats graphics
+rpeek xref stats lm
+rpeek used-by graphics plot
+rpeek snippet add --title "Read BIDS preproc scan" --package bidser --package neuroim2 --tag workflow --body "Use bidser to locate scans, then read them with neuroim2."
+rpeek snippet search "bids workflow"
 rpeek search-all --kind object --limit 10 lm
 rpeek sigs stats
+rpeek vignettes stats
+rpeek search-vignettes stats reshape
 rpeek resolve lm
 rpeek summary stats lm
 rpeek source stats lm
@@ -165,8 +205,17 @@ Then run a few common commands:
 
 ```bash
 cargo run -- search stats lm
+cargo run -- map stats
+cargo run -- methods-across plot --package stats --package graphics
+cargo run -- bridge stats graphics
+cargo run -- xref stats lm
+cargo run -- used-by graphics plot
+cargo run -- snippet add --title "Read BIDS preproc scan" --package bidser --package neuroim2 --tag workflow --body "Use bidser to locate scans, then read them with neuroim2."
+cargo run -- snippet search "bids workflow"
 cargo run -- search-all --kind object --limit 10 lm
 cargo run -- sigs stats
+cargo run -- vignettes stats
+cargo run -- search-vignettes stats reshape
 cargo run -- resolve lm
 cargo run -- summary stats lm
 cargo run -- source stats lm
@@ -178,8 +227,11 @@ If you prefer the built binary:
 
 ```bash
 target/debug/rpeek search stats lm
+target/debug/rpeek map stats
 target/debug/rpeek sigs stats
+target/debug/rpeek vignettes stats
 target/debug/rpeek summary stats lm
+target/debug/rpeek snippet list
 ```
 
 ## Agent-Friendly Workflows
@@ -188,6 +240,12 @@ Find likely symbols when you only know part of a name:
 
 ```bash
 cargo run -- search --kind object --limit 10 stats lm
+```
+
+Get a one-shot package map before drilling down:
+
+```bash
+cargo run -- map stats
 ```
 
 Find a symbol when you do not know the package:
@@ -218,6 +276,24 @@ Include non-exported namespace functions too:
 
 ```bash
 cargo run -- sigs --all-objects stats
+```
+
+List installed vignettes:
+
+```bash
+cargo run -- vignettes stats
+```
+
+Read one installed vignette:
+
+```bash
+cargo run -- vignette stats reshape
+```
+
+Search installed vignette titles and text:
+
+```bash
+cargo run -- search-vignettes stats reshape
 ```
 
 Read best-effort source:
@@ -321,6 +397,19 @@ target/debug/rpeek cache stats
 target/debug/rpeek cache clear
 ```
 
+Inspect, build, search, or clear the persistent index store:
+
+```bash
+target/debug/rpeek index status
+target/debug/rpeek index package stats
+target/debug/rpeek index show stats
+target/debug/rpeek index search stats reshape
+target/debug/rpeek index clear
+target/debug/rpeek snippet add --title "Read BIDS preproc scan" --package bidser --package neuroim2 --tag workflow --status verified --body "Use bidser to locate scans, then read them with neuroim2."
+target/debug/rpeek snippet search "bids workflow"
+target/debug/rpeek snippet list --package bidser
+```
+
 Inspect, stop, or restart a daemon bound to an explicit socket:
 
 ```bash
@@ -336,6 +425,34 @@ target/debug/rpeek --no-daemon summary stats lm
 ```
 
 Cache size defaults to 512 successful responses. Override it with `RPEEK_CACHE_ENTRIES`.
+
+The persistent index path defaults to `~/.cache/rpeek/index.sqlite3` (or `XDG_CACHE_HOME` when set). Override it with `RPEEK_INDEX_PATH`.
+
+`index package` stores one package bundle in SQLite, including package metadata, exported signatures, help topics and examples, installed vignettes, and selected text files from the installed package tree. `index search` queries that stored bundle without round-tripping through R for each search, and now uses SQLite `bm25(...)` ranking with a title boost so obvious topic hits rise above long file matches.
+
+Package-scoped metadata and search commands such as `pkg`, `exports`, `objects`, `search`, `sigs`, `vignettes`, `vignette`, and `search-vignettes` will lazily build or refresh that package index on first access when you are using the daemon-backed CLI path.
+
+`snippet add`, `snippet list`, `snippet show`, `snippet search`, and `snippet delete` use the same SQLite store for local workflow notes. Snippets keep package names, tags, verbs, a status field (`unknown`, `verified`, `stale`, `failed`), and the package versions known at insert time so stale workflow notes are easier to spot later.
+
+## Performance
+
+Run the warm-path benchmark harness in release mode:
+
+```bash
+cargo test --release --test perf -- --ignored --nocapture
+```
+
+Representative warm-path targets:
+
+- `map stats`: median <= 300ms, p95 <= 500ms
+- `search --kind topic --limit 5 stats lm`: median <= 150ms, p95 <= 300ms
+- `bridge stats graphics`: median <= 300ms, p95 <= 550ms
+
+To fail the benchmark run when targets are missed:
+
+```bash
+RPEEK_ENFORCE_BENCH_TARGETS=1 cargo test --release --test perf -- --ignored --nocapture
+```
 
 ## Protocol Schema
 
@@ -379,6 +496,9 @@ cargo run -- search --kind topic --limit 5 stats lm
 cargo run -- summary stats lm
 cargo run -- source stats lm
 cargo run -- doc stats lm
+cargo run -- vignettes stats
+cargo run -- vignette stats reshape
+cargo run -- search-vignettes stats reshape
 cargo run -- sig stats lmx
 cargo run -- sigs stats
 cargo run -- resolve lm

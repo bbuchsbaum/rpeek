@@ -1,5 +1,9 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
+use rpeek::index::{
+    IndexStore, IndexedFile, IndexedPackageData, IndexedPackageRecord, IndexedSnippet,
+    IndexedTopic, IndexedVignette, NewSnippet, PackageIndexState, now_timestamp,
+};
 use rpeek::protocol::Request;
 use rpeek::response::{
     ResponseOptions, apply_response_options, response_exit_code, response_is_success,
@@ -7,7 +11,7 @@ use rpeek::response::{
 };
 use rpeek::schema::{SchemaKind, schema_response};
 use serde_json::{Value, json};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::env;
 use std::fs;
 use std::fs::OpenOptions;
@@ -22,12 +26,23 @@ use std::time::{Duration, Instant};
 const SOCKET_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const HEALTHCHECK_TIMEOUT: Duration = Duration::from_millis(500);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const INDEX_TEXT_FILE_LIMIT: u64 = 512 * 1024;
 const HELPER_SCRIPT: &str = include_str!("r_helper.R");
 const AFTER_HELP: &str = "\
 Examples:
   rpeek search dplyr mutate
   rpeek search --kind topic --limit 5 stats lm
   rpeek search-all lm
+  rpeek map dplyr
+  rpeek methods-across predict --package stats --package graphics
+  rpeek bridge stats graphics
+  rpeek xref stats lm
+  rpeek used-by graphics plot
+  rpeek snippet add --title \"Read BIDS preproc scan\" --package bidser --package neuroim2 --tag workflow --body \"Use bidser to locate scans, then load with neuroim2.\"
+  rpeek snippet search \"bids workflow\"
+  rpeek sigs dplyr
+  rpeek vignettes dplyr
+  rpeek vignette dplyr rowwise
   rpeek summary dplyr mutate
   rpeek source dplyr mutate
   rpeek doc dplyr mutate
@@ -106,12 +121,51 @@ enum Commands {
     Summary { package: String, name: String },
     #[command(about = "Function signature or object metadata")]
     Sig { package: String, name: String },
+    #[command(about = "One-shot package orientation map for agents")]
+    Map { package: String },
+    #[command(about = "Find methods for one generic across indexed packages")]
+    MethodsAcross {
+        generic: String,
+        #[arg(long = "package")]
+        packages: Vec<String>,
+    },
+    #[command(about = "Summarize dependency and method overlap between two packages")]
+    Bridge {
+        package: String,
+        other_package: String,
+    },
+    #[command(about = "Show best-effort symbol xref for one package symbol")]
+    Xref { package: String, symbol: String },
+    #[command(about = "Show indexed callers of one package symbol across indexed packages")]
+    UsedBy { package: String, symbol: String },
+    #[command(
+        visible_alias = "signatures",
+        about = "Function signatures for one package"
+    )]
+    Sigs {
+        package: String,
+        #[arg(long, help = "Include non-exported namespace objects")]
+        all_objects: bool,
+    },
     #[command(visible_alias = "src", about = "Best-effort source retrieval")]
     Source { package: String, name: String },
     #[command(about = "Installed help / roxygen-derived docs")]
     Doc { package: String, topic: String },
+    #[command(hide = true, about = "Installed help topic names")]
+    Topics { package: String },
     #[command(about = "Related S3/S4 methods")]
     Methods { package: String, name: String },
+    #[command(about = "Installed vignette metadata")]
+    Vignettes { package: String },
+    #[command(about = "Read one installed vignette")]
+    Vignette { package: String, name: String },
+    #[command(about = "Search installed vignette titles and text")]
+    SearchVignettes {
+        package: String,
+        query: String,
+        #[arg(long, default_value_t = 25)]
+        limit: usize,
+    },
     #[command(about = "Installed package files")]
     Files { package: String },
     #[command(about = "Search installed package files")]
@@ -125,6 +179,11 @@ enum Commands {
     },
     #[command(about = "Quick usage guide for agents and scripts")]
     Agent,
+    #[command(about = "Store and retrieve workflow snippets in the persistent index")]
+    Snippet {
+        #[command(subcommand)]
+        command: SnippetCommands,
+    },
     #[command(about = "Check prerequisites (R, jsonlite, etc.)")]
     Doctor,
     #[command(about = "Print JSON schema for request or response contracts")]
@@ -136,6 +195,11 @@ enum Commands {
     Batch {
         #[arg(long)]
         file: Option<PathBuf>,
+    },
+    #[command(about = "Inspect or reset the persistent index metadata store")]
+    Index {
+        #[command(subcommand)]
+        command: IndexCommands,
     },
     #[command(hide = true, about = "Stop the background daemon")]
     Shutdown,
@@ -162,6 +226,77 @@ enum CacheCommands {
 }
 
 #[derive(Debug, Subcommand)]
+enum IndexCommands {
+    #[command(about = "Show persistent index metadata status")]
+    Status,
+    #[command(about = "Clear persistent index metadata")]
+    Clear,
+    #[command(about = "Index one installed package into the persistent store")]
+    Package { package: String },
+    #[command(about = "Show persistent indexed content counts for one package")]
+    Show { package: String },
+    #[command(about = "Search indexed docs, vignettes, examples, and files for one package")]
+    Search {
+        package: String,
+        query: String,
+        #[arg(long, default_value_t = 25)]
+        limit: usize,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SnippetCommands {
+    #[command(about = "Add one indexed workflow snippet")]
+    Add {
+        #[arg(long)]
+        title: String,
+        #[arg(long = "package")]
+        packages: Vec<String>,
+        #[arg(long = "object")]
+        objects: Vec<String>,
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        #[arg(long = "verb")]
+        verbs: Vec<String>,
+        #[arg(long, value_enum, default_value_t = SnippetStatusArg::Unknown)]
+        status: SnippetStatusArg,
+        #[arg(long)]
+        source: Option<String>,
+        #[arg(long, conflicts_with = "body")]
+        file: Option<PathBuf>,
+        #[arg(long, conflicts_with = "file")]
+        body: Option<String>,
+    },
+    #[command(about = "List stored snippets")]
+    List {
+        #[arg(long = "package")]
+        package: Option<String>,
+        #[arg(long = "tag")]
+        tag: Option<String>,
+        #[arg(long, value_enum)]
+        status: Option<SnippetStatusArg>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    #[command(about = "Show one stored snippet")]
+    Show { id: i64 },
+    #[command(about = "Search stored snippets with bm25-ranked FTS")]
+    Search {
+        query: String,
+        #[arg(long = "package")]
+        package: Option<String>,
+        #[arg(long = "tag")]
+        tag: Option<String>,
+        #[arg(long, value_enum)]
+        status: Option<SnippetStatusArg>,
+        #[arg(long, default_value_t = 25)]
+        limit: usize,
+    },
+    #[command(about = "Delete one stored snippet")]
+    Delete { id: i64 },
+}
+
+#[derive(Debug, Subcommand)]
 enum DaemonCommands {
     #[command(about = "Show daemon status")]
     Status,
@@ -176,6 +311,39 @@ enum SearchKind {
     All,
     Object,
     Topic,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StalePackageInfo {
+    package: String,
+    recorded_version: Option<String>,
+    current_version: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SnippetStatusEvaluation {
+    effective_status: String,
+    stale_packages: Vec<StalePackageInfo>,
+    current_package_versions: BTreeMap<String, String>,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum SnippetStatusArg {
+    Unknown,
+    Verified,
+    Stale,
+    Failed,
+}
+
+impl SnippetStatusArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Verified => "verified",
+            Self::Stale => "stale",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 impl SearchKind {
@@ -229,9 +397,39 @@ fn run() -> Result<Value> {
             }))
         }
         Commands::Agent => Ok(agent_response()),
+        Commands::Snippet { command } => Ok(snippet_response(command)?),
         Commands::Doctor => Ok(doctor_response()),
         Commands::Schema { kind } => Ok(schema_response(kind)),
         Commands::Batch { file } => Ok(batch_response(file, &response_options)?),
+        Commands::Index {
+            command: IndexCommands::Status,
+        } => Ok(index_status_response()?),
+        Commands::Index {
+            command: IndexCommands::Clear,
+        } => Ok(index_clear_response()?),
+        Commands::Index {
+            command: IndexCommands::Package { package },
+        } => Ok(index_package_response(&package)?),
+        Commands::Index {
+            command: IndexCommands::Show { package },
+        } => Ok(index_show_response(&package)?),
+        Commands::Index {
+            command:
+                IndexCommands::Search {
+                    package,
+                    query,
+                    limit,
+                },
+        } => Ok(index_search_response(&package, &query, limit)?),
+        Commands::MethodsAcross { generic, packages } => {
+            Ok(methods_across_response(&generic, &packages)?)
+        }
+        Commands::Bridge {
+            package,
+            other_package,
+        } => Ok(bridge_response(&package, &other_package)?),
+        Commands::Xref { package, symbol } => Ok(xref_response(&package, &symbol)?),
+        Commands::UsedBy { package, symbol } => Ok(used_by_response(&package, &symbol)?),
         Commands::Daemon {
             command: DaemonCommands::Restart,
         } => {
@@ -290,9 +488,33 @@ fn request_from_command(command: Commands) -> Result<Request> {
         },
         Commands::Summary { package, name } => Request::Summary { package, name },
         Commands::Sig { package, name } => Request::Sig { package, name },
+        Commands::Map { package } => Request::Map { package },
+        Commands::MethodsAcross { .. } => bail!("methods-across is handled directly"),
+        Commands::Bridge { .. } => bail!("bridge is handled directly"),
+        Commands::Xref { .. } => bail!("xref is handled directly"),
+        Commands::UsedBy { .. } => bail!("used-by is handled directly"),
+        Commands::Sigs {
+            package,
+            all_objects,
+        } => Request::Sigs {
+            package,
+            all_objects,
+        },
         Commands::Source { package, name } => Request::Source { package, name },
         Commands::Doc { package, topic } => Request::Doc { package, topic },
+        Commands::Topics { package } => Request::Topics { package },
         Commands::Methods { package, name } => Request::Methods { package, name },
+        Commands::Vignettes { package } => Request::Vignettes { package },
+        Commands::Vignette { package, name } => Request::Vignette { package, name },
+        Commands::SearchVignettes {
+            package,
+            query,
+            limit,
+        } => Request::SearchVignettes {
+            package,
+            query,
+            limit,
+        },
         Commands::Files { package } => Request::Files { package },
         Commands::Grep {
             package,
@@ -309,7 +531,9 @@ fn request_from_command(command: Commands) -> Result<Request> {
             CacheCommands::Clear => Request::CacheClear,
             CacheCommands::Stats => Request::CacheStats,
         },
+        Commands::Index { .. } => bail!("index is not a daemon command"),
         Commands::Agent => bail!("agent is not a daemon command"),
+        Commands::Snippet { .. } => bail!("snippet is handled directly"),
         Commands::Batch { .. } => bail!("batch is not a daemon command"),
         Commands::Schema { .. } => bail!("schema is not a daemon command"),
         Commands::Shutdown => Request::Shutdown,
@@ -369,6 +593,49 @@ fn query_helper_once(request: &Request, options: &ResponseOptions) -> Result<Val
     }
     apply_response_options(&mut value, options);
     Ok(value)
+}
+
+fn query_helper_value(
+    helper: &mut HelperProcess,
+    socket: &Path,
+    request: &Request,
+) -> Result<Value> {
+    let line = serde_json::to_string(request)?;
+    let response = helper
+        .send(&line)
+        .or_else(|_| helper.restart(socket, &line))
+        .context("failed to query R helper")?;
+    let value: Value = serde_json::from_str(response.trim())
+        .with_context(|| format!("invalid JSON response from helper: {response}"))?;
+    if !response_reports_success(&value) {
+        let error = value
+            .get("error")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let code = error
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("helper_error");
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("R helper request failed");
+        bail!("{code}: {message}");
+    }
+    Ok(value)
+}
+
+fn query_helper_payload(
+    helper: &mut HelperProcess,
+    socket: &Path,
+    request: &Request,
+) -> Result<Value> {
+    let value = query_helper_value(helper, socket, request)?;
+    value
+        .get("payload")
+        .cloned()
+        .ok_or_else(|| anyhow!("helper response missing payload"))
 }
 
 fn ensure_daemon_running(socket: &Path) -> Result<()> {
@@ -518,7 +785,7 @@ fn serve(socket: PathBuf) -> Result<()> {
     let listener = UnixListener::bind(&socket)
         .with_context(|| format!("failed to bind daemon socket at {}", socket.display()))?;
     let mut helper = HelperProcess::start(&socket)?;
-    let mut cache = ResponseCache::default();
+    let mut cache = ResponseCache::new()?;
 
     for stream in listener.incoming() {
         match stream {
@@ -595,7 +862,8 @@ fn daemon_status_response(
             "pid": std::process::id(),
             "socket": socket.display().to_string(),
             "helper_alive": helper.is_alive(),
-            "cache": cache.stats_payload()
+            "cache": cache.stats_payload(),
+            "index": cache.index_payload()
         }
     })
     .to_string()
@@ -629,6 +897,16 @@ fn handle_query_request(
             return Ok(response);
         }
 
+        if request.can_use_index() {
+            cache.ensure_indexed_package(package, &key.fingerprint, helper, socket)?;
+            if let Some(response) = cache.indexed_response(request)? {
+                if response_is_success(&response) {
+                    cache.insert(key, response.clone());
+                }
+                return Ok(response);
+            }
+        }
+
         let response = helper
             .send(line)
             .or_else(|_| helper.restart(socket, line))
@@ -643,6 +921,109 @@ fn handle_query_request(
         .send(line)
         .or_else(|_| helper.restart(socket, line))
         .context("failed to query R helper")
+}
+
+fn indexed_request_response(cache: &ResponseCache, request: &Request) -> Result<Option<String>> {
+    let package = match request.package() {
+        Some(package) => package,
+        None => return Ok(None),
+    };
+    let Some(package_data) = cache.index.get_indexed_package_data(package)? else {
+        return Ok(None);
+    };
+
+    let payload = match request {
+        Request::Pkg { .. } => package_data.package_json.clone(),
+        Request::Exports { .. } => json!({
+            "package": package,
+            "exports": package_data.exports,
+        }),
+        Request::Objects { .. } => json!({
+            "package": package,
+            "objects": package_data.objects,
+        }),
+        Request::Search {
+            query, kind, limit, ..
+        } => indexed_search_payload(
+            &package_data,
+            &cache.index.get_indexed_topics(package)?,
+            query,
+            kind,
+            *limit,
+        ),
+        Request::Map { .. } => indexed_map_payload(
+            &package_data,
+            &cache.index.get_indexed_topics(package)?,
+            &cache.index.get_indexed_vignettes(package)?,
+            &cache.index.get_indexed_files(package)?,
+        ),
+        Request::Sigs { all_objects, .. } if !all_objects => {
+            let signatures = package_data
+                .signatures_json
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            json!({
+                "package": package,
+                "all_objects": false,
+                "counts": {
+                    "scanned": package_data.objects.len(),
+                    "signatures": signatures.len(),
+                },
+                "signatures": signatures,
+            })
+        }
+        Request::Topics { .. } => {
+            let topics = cache
+                .index
+                .get_indexed_topics(package)?
+                .into_iter()
+                .map(|topic| topic.topic)
+                .collect::<Vec<_>>();
+            json!({
+                "package": package,
+                "topics": topics,
+            })
+        }
+        Request::Vignettes { .. } => {
+            let vignettes = cache
+                .index
+                .get_indexed_vignettes(package)?
+                .into_iter()
+                .map(vignette_listing_json)
+                .collect::<Vec<_>>();
+            json!({
+                "package": package,
+                "vignettes": vignettes,
+                "counts": {
+                    "vignettes": vignettes.len(),
+                }
+            })
+        }
+        Request::Vignette { name, .. } => {
+            let vignettes = cache.index.get_indexed_vignettes(package)?;
+            let Some(vignette) = match_vignette(&vignettes, name) else {
+                return Ok(None);
+            };
+            vignette_detail_json(package, &vignette)
+        }
+        Request::SearchVignettes { query, limit, .. } => indexed_search_vignettes_payload(
+            package,
+            &cache.index.get_indexed_vignettes(package)?,
+            query,
+            *limit,
+        ),
+        _ => return Ok(None),
+    };
+
+    Ok(Some(
+        json!({
+            "schema_version": 1,
+            "ok": true,
+            "payload": payload
+        })
+        .to_string(),
+    ))
 }
 
 fn read_request_line(stream: &mut UnixStream) -> Result<String> {
@@ -902,6 +1283,26 @@ fn agent_response() -> Value {
         "payload": {
             "workflows": [
                 {
+                    "task": "Get a one-shot package orientation map",
+                    "command": "rpeek map <package>"
+                },
+                {
+                    "task": "Find methods for one generic across packages",
+                    "command": "rpeek methods-across <generic> --package <pkg>..."
+                },
+                {
+                    "task": "Compare two packages' dependency and method overlap",
+                    "command": "rpeek bridge <package> <other-package>"
+                },
+                {
+                    "task": "Trace one symbol's local and cross-package usage",
+                    "command": "rpeek xref <package> <symbol>"
+                },
+                {
+                    "task": "Find indexed callers of one symbol",
+                    "command": "rpeek used-by <package> <symbol>"
+                },
+                {
                     "task": "Find likely symbols",
                     "command": "rpeek search <package> <query>"
                 },
@@ -920,6 +1321,22 @@ fn agent_response() -> Value {
                         "rpeek summary <package> <object>",
                         "rpeek doc <package> <topic>"
                     ]
+                },
+                {
+                    "task": "List installed package vignettes",
+                    "command": "rpeek vignettes <package>"
+                },
+                {
+                    "task": "Read one installed vignette",
+                    "command": "rpeek vignette <package> <name>"
+                },
+                {
+                    "task": "Search installed vignette titles and text",
+                    "command": "rpeek search-vignettes <package> <query>"
+                },
+                {
+                    "task": "Get function signatures for one package",
+                    "command": "rpeek sigs <package>"
                 },
                 {
                     "task": "Get one-call object summary",
@@ -957,6 +1374,1679 @@ fn agent_response() -> Value {
             ]
         }
     })
+}
+
+fn index_package_response(package: &str) -> Result<Value> {
+    let socket = env::temp_dir().join(format!(
+        "rpeek-index-build-{}-{}.sock",
+        std::process::id(),
+        now_timestamp().unwrap_or_default()
+    ));
+    let mut helper = HelperProcess::start(&socket)?;
+    let record = build_indexed_package_record(package, &mut helper, &socket)?;
+    let mut store = IndexStore::open_default()?;
+    let fingerprint = package_fingerprint(&record.install_path)?;
+    let helper_fingerprint = record.version.clone();
+    let package = record.package.clone();
+    let indexed_at = record.indexed_at;
+
+    store.upsert_package_record(&record)?;
+    store.upsert_package_state(&PackageIndexState {
+        package: package.clone(),
+        install_path: record.install_path.clone(),
+        helper_fingerprint,
+        local_fingerprint: fingerprint,
+        updated_at: indexed_at,
+    })?;
+
+    let summary = store
+        .get_indexed_package_summary(&package)?
+        .ok_or_else(|| anyhow!("indexed package summary missing after write"))?;
+
+    Ok(json!({
+        "schema_version": 1,
+        "ok": true,
+        "command": "index_package",
+        "payload": summary
+    }))
+}
+
+fn index_show_response(package: &str) -> Result<Value> {
+    let store = IndexStore::open_default()?;
+    let summary = store
+        .get_indexed_package_summary(package)?
+        .ok_or_else(|| anyhow!("package '{package}' is not indexed"))?;
+    Ok(json!({
+        "schema_version": 1,
+        "ok": true,
+        "command": "index_show",
+        "payload": summary
+    }))
+}
+
+fn index_search_response(package: &str, query: &str, limit: usize) -> Result<Value> {
+    let store = IndexStore::open_default()?;
+    let matches = store.search_package_documents(package, query, limit)?;
+    Ok(json!({
+        "schema_version": 1,
+        "ok": true,
+        "command": "index_search",
+        "payload": {
+            "package": package,
+            "query": query,
+            "limit": limit,
+            "matches": matches,
+            "count": matches.len()
+        }
+    }))
+}
+
+fn snippet_response(command: SnippetCommands) -> Result<Value> {
+    match command {
+        SnippetCommands::Add {
+            title,
+            packages,
+            objects,
+            tags,
+            verbs,
+            status,
+            source,
+            file,
+            body,
+        } => snippet_add_response(
+            &title,
+            &packages,
+            &objects,
+            &tags,
+            &verbs,
+            status,
+            source,
+            file.as_deref(),
+            body.as_deref(),
+        ),
+        SnippetCommands::List {
+            package,
+            tag,
+            status,
+            limit,
+        } => snippet_list_response(
+            package.as_deref(),
+            tag.as_deref(),
+            status.map(SnippetStatusArg::as_str),
+            limit,
+        ),
+        SnippetCommands::Show { id } => snippet_show_response(id),
+        SnippetCommands::Search {
+            query,
+            package,
+            tag,
+            status,
+            limit,
+        } => snippet_search_response(
+            &query,
+            package.as_deref(),
+            tag.as_deref(),
+            status.map(SnippetStatusArg::as_str),
+            limit,
+        ),
+        SnippetCommands::Delete { id } => snippet_delete_response(id),
+    }
+}
+
+fn snippet_add_response(
+    title: &str,
+    packages: &[String],
+    objects: &[String],
+    tags: &[String],
+    verbs: &[String],
+    status: SnippetStatusArg,
+    source: Option<String>,
+    file: Option<&Path>,
+    body: Option<&str>,
+) -> Result<Value> {
+    let body = snippet_body_input(file, body)?;
+    let package_versions = indexed_package_versions(packages)?;
+    let mut store = IndexStore::open_default()?;
+    let snippet = store.add_snippet(&NewSnippet {
+        title: title.to_string(),
+        body,
+        packages: packages.to_vec(),
+        objects: objects.to_vec(),
+        tags: tags.to_vec(),
+        verbs: verbs.to_vec(),
+        status: status.as_str().to_string(),
+        source,
+        package_versions,
+    })?;
+
+    Ok(json!({
+        "schema_version": 1,
+        "ok": true,
+        "command": "snippet_add",
+        "payload": snippet_json(&snippet),
+    }))
+}
+
+fn snippet_list_response(
+    package: Option<&str>,
+    tag: Option<&str>,
+    status: Option<&str>,
+    limit: usize,
+) -> Result<Value> {
+    let store = IndexStore::open_default()?;
+    let snippets = store.list_snippets(package, tag, status, limit)?;
+    let items = snippets
+        .iter()
+        .map(snippet_summary_json)
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "schema_version": 1,
+        "ok": true,
+        "command": "snippet_list",
+        "payload": {
+            "filters": {
+                "package": package,
+                "tag": tag,
+                "status": status,
+            },
+            "count": items.len(),
+            "snippets": items,
+        }
+    }))
+}
+
+fn snippet_show_response(id: i64) -> Result<Value> {
+    let store = IndexStore::open_default()?;
+    let snippet = store
+        .get_snippet(id)?
+        .ok_or_else(|| anyhow!("snippet '{id}' was not found"))?;
+    Ok(json!({
+        "schema_version": 1,
+        "ok": true,
+        "command": "snippet_show",
+        "payload": snippet_json(&snippet),
+    }))
+}
+
+fn snippet_search_response(
+    query: &str,
+    package: Option<&str>,
+    tag: Option<&str>,
+    status: Option<&str>,
+    limit: usize,
+) -> Result<Value> {
+    let store = IndexStore::open_default()?;
+    let matches = store.search_snippets(query, package, tag, status, limit)?;
+    let results = matches
+        .into_iter()
+        .filter_map(|entry| {
+            let id = entry.key.parse::<i64>().ok()?;
+            let snippet = store.get_snippet(id).ok()??;
+            Some(json!({
+                "id": id,
+                "title": snippet.title,
+                "status": snippet.status,
+                "packages": snippet.packages,
+                "tags": snippet.tags,
+                "score": entry.score,
+                "snippet": entry.snippet,
+            }))
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "schema_version": 1,
+        "ok": true,
+        "command": "snippet_search",
+        "payload": {
+            "query": query,
+            "filters": {
+                "package": package,
+                "tag": tag,
+                "status": status,
+            },
+            "count": results.len(),
+            "matches": results,
+        }
+    }))
+}
+
+fn snippet_delete_response(id: i64) -> Result<Value> {
+    let mut store = IndexStore::open_default()?;
+    let deleted = store.delete_snippet(id)?;
+    Ok(json!({
+        "schema_version": 1,
+        "ok": true,
+        "command": "snippet_delete",
+        "payload": {
+            "id": id,
+            "deleted": deleted,
+        }
+    }))
+}
+
+fn snippet_body_input(file: Option<&Path>, body: Option<&str>) -> Result<String> {
+    let text = if let Some(file) = file {
+        fs::read_to_string(file)
+            .with_context(|| format!("failed to read snippet body from {}", file.display()))?
+    } else if let Some(body) = body {
+        body.to_string()
+    } else {
+        let mut stdin = String::new();
+        std::io::stdin()
+            .read_to_string(&mut stdin)
+            .context("failed to read snippet body from stdin")?;
+        stdin
+    };
+
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        bail!("snippet body is empty");
+    }
+    Ok(trimmed.to_string())
+}
+
+fn indexed_package_versions(
+    packages: &[String],
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut versions = std::collections::BTreeMap::new();
+    if packages.is_empty() {
+        return Ok(versions);
+    }
+
+    let store = ensure_packages_indexed(packages)?;
+    for package in packages {
+        if let Some(summary) = store.get_indexed_package_summary(package)?
+            && let Some(version) = summary.version
+        {
+            versions.insert(package.clone(), version);
+        }
+    }
+    Ok(versions)
+}
+
+fn snippet_json(snippet: &IndexedSnippet) -> Value {
+    json!({
+        "id": snippet.id,
+        "title": snippet.title,
+        "body": snippet.body,
+        "packages": snippet.packages,
+        "objects": snippet.objects,
+        "tags": snippet.tags,
+        "verbs": snippet.verbs,
+        "status": snippet.status,
+        "source": snippet.source,
+        "package_versions": snippet.package_versions,
+        "created_at": snippet.created_at,
+        "updated_at": snippet.updated_at,
+    })
+}
+
+fn snippet_summary_json(snippet: &IndexedSnippet) -> Value {
+    json!({
+        "id": snippet.id,
+        "title": snippet.title,
+        "status": snippet.status,
+        "packages": snippet.packages,
+        "tags": snippet.tags,
+        "verbs": snippet.verbs,
+        "updated_at": snippet.updated_at,
+        "body_preview": first_text_line(&snippet.body),
+    })
+}
+
+fn first_text_line(text: &str) -> String {
+    text.lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .take(160)
+        .collect()
+}
+
+fn methods_across_response(generic: &str, packages: &[String]) -> Result<Value> {
+    let store = if packages.is_empty() {
+        IndexStore::open_default()?
+    } else {
+        ensure_packages_indexed(packages)?
+    };
+    let package_scope = if packages.is_empty() {
+        store.indexed_packages()?
+    } else {
+        packages.to_vec()
+    };
+    let methods = store.find_methods(
+        generic,
+        if packages.is_empty() {
+            None
+        } else {
+            Some(package_scope.as_slice())
+        },
+    )?;
+    let matched_packages = methods
+        .iter()
+        .map(|method| method.package.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+
+    Ok(json!({
+        "schema_version": 1,
+        "ok": true,
+        "command": "methods_across",
+        "payload": {
+            "generic": generic,
+            "packages": package_scope,
+            "methods": methods,
+            "counts": {
+                "methods": methods.len(),
+                "packages": matched_packages,
+            }
+        }
+    }))
+}
+
+fn xref_response(package: &str, symbol: &str) -> Result<Value> {
+    let packages = vec![package.to_string()];
+    let store = ensure_packages_indexed(&packages)?;
+    let package_data = store
+        .get_indexed_package_data(package)?
+        .ok_or_else(|| anyhow!("package '{package}' is not indexed"))?;
+    let call_refs = store.get_call_refs(package)?;
+    let outgoing_calls = call_refs
+        .iter()
+        .filter(|call_ref| call_ref.caller_symbol.as_deref() == Some(symbol))
+        .map(call_ref_json)
+        .collect::<Vec<_>>();
+    let incoming_calls = store
+        .find_calls_to_symbol(package, symbol)?
+        .iter()
+        .map(call_ref_json)
+        .collect::<Vec<_>>();
+    let local_mentions = collect_symbol_mentions(
+        symbol,
+        &store.get_indexed_files(package)?,
+        &store.get_indexed_topics(package)?,
+        &store.get_indexed_vignettes(package)?,
+    );
+
+    Ok(json!({
+        "schema_version": 1,
+        "ok": true,
+        "command": "xref",
+        "payload": {
+            "package": package,
+            "symbol": symbol,
+            "exported": package_data.exports.iter().any(|exported| exported == symbol),
+            "defined_in_namespace": package_data.objects.iter().any(|object| object == symbol),
+            "outgoing_calls": outgoing_calls,
+            "incoming_calls": incoming_calls,
+            "local_mentions": local_mentions,
+            "counts": {
+                "outgoing_calls": outgoing_calls.len(),
+                "incoming_calls": incoming_calls.len(),
+                "file_mentions": local_mentions["files"].as_array().map(Vec::len).unwrap_or_default(),
+                "topic_mentions": local_mentions["topics"].as_array().map(Vec::len).unwrap_or_default(),
+                "vignette_mentions": local_mentions["vignettes"].as_array().map(Vec::len).unwrap_or_default(),
+            }
+        }
+    }))
+}
+
+fn used_by_response(package: &str, symbol: &str) -> Result<Value> {
+    let packages = vec![package.to_string()];
+    let store = ensure_packages_indexed(&packages)?;
+    let callers = store
+        .find_calls_to_symbol(package, symbol)?
+        .iter()
+        .map(call_ref_json)
+        .collect::<Vec<_>>();
+    let matched_packages = callers
+        .iter()
+        .filter_map(|call| call.get("package").and_then(Value::as_str))
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+
+    Ok(json!({
+        "schema_version": 1,
+        "ok": true,
+        "command": "used_by",
+        "payload": {
+            "package": package,
+            "symbol": symbol,
+            "callers": callers,
+            "counts": {
+                "calls": callers.len(),
+                "packages": matched_packages,
+            }
+        }
+    }))
+}
+
+fn bridge_response(package: &str, other_package: &str) -> Result<Value> {
+    let package_list = vec![package.to_string(), other_package.to_string()];
+    let store = ensure_packages_indexed(&package_list)?;
+
+    let _left_data = store
+        .get_indexed_package_data(package)?
+        .ok_or_else(|| anyhow!("package '{package}' is not indexed"))?;
+    let _right_data = store
+        .get_indexed_package_data(other_package)?
+        .ok_or_else(|| anyhow!("package '{other_package}' is not indexed"))?;
+    let left_links = store.get_package_links(package)?;
+    let right_links = store.get_package_links(other_package)?;
+    let left_methods = store.get_indexed_methods(package)?;
+    let right_methods = store.get_indexed_methods(other_package)?;
+    let left_topics_data = store.get_indexed_topics(package)?;
+    let right_topics_data = store.get_indexed_topics(other_package)?;
+    let left_topics = left_topics_data
+        .iter()
+        .map(|topic| topic.topic.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let right_topics = right_topics_data
+        .iter()
+        .map(|topic| topic.topic.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let left_files = store.get_indexed_files(package)?;
+    let right_files = store.get_indexed_files(other_package)?;
+    let left_vignettes = store.get_indexed_vignettes(package)?;
+    let right_vignettes = store.get_indexed_vignettes(other_package)?;
+    let left_call_refs = store.get_call_refs(package)?;
+    let right_call_refs = store.get_call_refs(other_package)?;
+
+    let package_to_other = left_links
+        .iter()
+        .filter(|link| link.related_package == other_package)
+        .map(|link| link.relation.clone())
+        .collect::<Vec<_>>();
+    let other_to_package = right_links
+        .iter()
+        .filter(|link| link.related_package == package)
+        .map(|link| link.relation.clone())
+        .collect::<Vec<_>>();
+
+    let left_deps = left_links
+        .iter()
+        .map(|link| link.related_package.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let right_deps = right_links
+        .iter()
+        .map(|link| link.related_package.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let shared_dependencies = left_deps
+        .intersection(&right_deps)
+        .filter(|dependency| !is_bridge_noise_dependency(dependency))
+        .take(20)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let left_generics = left_methods
+        .iter()
+        .map(|method| method.generic.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let right_generics = right_methods
+        .iter()
+        .map(|method| method.generic.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let shared_generics = left_generics
+        .intersection(&right_generics)
+        .filter(|generic| !is_bridge_noise_generic(generic))
+        .take(20)
+        .cloned()
+        .collect::<Vec<_>>();
+    let shared_topics = left_topics
+        .intersection(&right_topics)
+        .take(20)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let package_to_other_usage = directional_bridge_usage(
+        package,
+        other_package,
+        &package_to_other,
+        &left_call_refs,
+        &left_files,
+        &left_topics_data,
+        &left_vignettes,
+    );
+    let other_to_package_usage = directional_bridge_usage(
+        other_package,
+        package,
+        &other_to_package,
+        &right_call_refs,
+        &right_files,
+        &right_topics_data,
+        &right_vignettes,
+    );
+
+    Ok(json!({
+        "schema_version": 1,
+        "ok": true,
+        "command": "bridge",
+        "payload": {
+            "package": package,
+            "other_package": other_package,
+            "direct_relations": {
+                "package_to_other": package_to_other,
+                "other_to_package": other_to_package,
+            },
+            "direct_usage": {
+                "package_to_other": package_to_other_usage,
+                "other_to_package": other_to_package_usage,
+            },
+            "counts": {
+                "package_methods": left_methods.len(),
+                "other_package_methods": right_methods.len(),
+                "shared_generics": shared_generics.len(),
+                "shared_topics": shared_topics.len(),
+            },
+            "shared_generics": shared_generics,
+            "shared_topics": shared_topics,
+            "shared_dependencies": shared_dependencies,
+            "drill_down": [
+                format!("rpeek methods-across <generic> --package {package} --package {other_package}"),
+                format!("rpeek map {package}"),
+                format!("rpeek map {other_package}"),
+            ],
+        }
+    }))
+}
+
+fn ensure_packages_indexed(packages: &[String]) -> Result<IndexStore> {
+    let mut store = IndexStore::open_default()?;
+    let mut helper: Option<HelperProcess> = None;
+    let socket = env::temp_dir().join(format!(
+        "rpeek-cross-index-{}-{}.sock",
+        std::process::id(),
+        now_timestamp().unwrap_or_default()
+    ));
+
+    let mut seen = std::collections::BTreeSet::new();
+    for package in packages {
+        if !seen.insert(package.clone()) {
+            continue;
+        }
+        let package_name = package.as_str();
+        let needs_index = match (
+            store.get_package_state(package_name)?,
+            store.get_indexed_package_summary(package_name)?,
+        ) {
+            (Some(state), Some(_)) if state.install_path.exists() => {
+                package_fingerprint(&state.install_path)? != state.local_fingerprint
+            }
+            _ => true,
+        };
+
+        if !needs_index {
+            continue;
+        }
+
+        if helper.is_none() {
+            helper = Some(HelperProcess::start(&socket)?);
+        }
+        let helper_ref = helper
+            .as_mut()
+            .ok_or_else(|| anyhow!("failed to initialize indexing helper"))?;
+        let record = build_indexed_package_record(package_name, helper_ref, &socket)?;
+        let fingerprint = package_fingerprint(&record.install_path)?;
+        let install_path = record.install_path.clone();
+        let helper_fingerprint = record.version.clone();
+        let indexed_at = record.indexed_at;
+        store.upsert_package_record(&record)?;
+        store.upsert_package_state(&PackageIndexState {
+            package: package_name.to_string(),
+            install_path,
+            helper_fingerprint,
+            local_fingerprint: fingerprint,
+            updated_at: indexed_at,
+        })?;
+    }
+
+    Ok(store)
+}
+
+fn is_bridge_noise_dependency(name: &str) -> bool {
+    matches!(
+        name,
+        "covr"
+            | "knitr"
+            | "pkgdown"
+            | "rmarkdown"
+            | "testthat"
+            | "roxygen2"
+            | "devtools"
+            | "usethis"
+            | "withr"
+    )
+}
+
+fn is_bridge_noise_generic(name: &str) -> bool {
+    matches!(
+        name,
+        "as" | "print" | "plot" | "summary" | "show" | "format" | "c" | "names"
+    )
+}
+
+fn namespace_imports_all(text: &str, target_package: &str) -> bool {
+    text.lines().any(|line| {
+        let compact = line.replace(' ', "");
+        compact.contains(&format!("import({target_package})"))
+    })
+}
+
+fn namespace_imported_symbols(text: &str, target_package: &str) -> Vec<String> {
+    let mut symbols = std::collections::BTreeSet::new();
+    let compact_target = target_package.replace(' ', "");
+    for line in text.lines() {
+        let compact = line.replace(' ', "");
+        if let Some(rest) = compact.strip_prefix("importFrom(")
+            && let Some(end) = rest.find(')')
+        {
+            let inner = &rest[..end];
+            let mut parts = inner.split(',');
+            if parts.next() == Some(compact_target.as_str()) {
+                for symbol in parts {
+                    if !symbol.is_empty() {
+                        symbols.insert(symbol.to_string());
+                    }
+                }
+            }
+        }
+        if let Some(rest) = line.trim().strip_prefix("@importFrom") {
+            let mut parts = rest.split_whitespace();
+            if parts.next() == Some(target_package) {
+                for symbol in parts {
+                    symbols.insert(symbol.trim_matches(',').to_string());
+                }
+            }
+        }
+    }
+    symbols.into_iter().collect()
+}
+
+fn collect_package_mentions_in_files(files: &[IndexedFile], target_package: &str) -> Vec<Value> {
+    let mut mentions = Vec::new();
+    for file in files {
+        if let Some(line_number) = first_line_with_package_name(&file.text, target_package) {
+            mentions.push(json!({
+                "path": file.path,
+                "line": line_number,
+            }));
+        }
+    }
+    dedup_json_values(mentions)
+}
+
+fn collect_package_mentions_in_topics(topics: &[IndexedTopic], target_package: &str) -> Vec<Value> {
+    let mut mentions = Vec::new();
+    for topic in topics {
+        if topic
+            .text
+            .as_deref()
+            .is_some_and(|text| contains_package_name(text, target_package))
+        {
+            mentions.push(json!({
+                "topic": topic.topic,
+                "title": topic.title,
+            }));
+        }
+    }
+    dedup_json_values(mentions)
+}
+
+fn collect_package_mentions_in_vignettes(
+    vignettes: &[IndexedVignette],
+    target_package: &str,
+) -> Vec<Value> {
+    let mut mentions = Vec::new();
+    for vignette in vignettes {
+        if vignette
+            .text
+            .as_deref()
+            .is_some_and(|text| contains_package_name(text, target_package))
+        {
+            mentions.push(json!({
+                "topic": vignette.topic,
+                "title": vignette.title,
+            }));
+        }
+    }
+    dedup_json_values(mentions)
+}
+
+fn first_line_with_package_name(text: &str, target_package: &str) -> Option<usize> {
+    text.lines()
+        .enumerate()
+        .find(|(_, line)| contains_package_name(line, target_package))
+        .map(|(index, _)| index + 1)
+}
+
+fn first_line_with_symbol(text: &str, symbol: &str) -> Option<usize> {
+    text.lines()
+        .enumerate()
+        .find(|(_, line)| contains_symbol_name(line, symbol))
+        .map(|(index, _)| index + 1)
+}
+
+fn contains_package_name(text: &str, target_package: &str) -> bool {
+    let lower_text = text.to_ascii_lowercase();
+    let lower_package = target_package.to_ascii_lowercase();
+    lower_text.contains(&format!("{lower_package}::"))
+        || lower_text.contains(&format!("{lower_package}:::"))
+        || lower_text.contains(&lower_package)
+}
+
+fn contains_symbol_name(text: &str, symbol: &str) -> bool {
+    text.contains(&format!("{symbol}(")) || text.contains(symbol)
+}
+
+fn dedup_json_values(values: Vec<Value>) -> Vec<Value> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for value in values {
+        let key = value.to_string();
+        if seen.insert(key) {
+            out.push(value);
+        }
+    }
+    out
+}
+
+fn directional_bridge_usage(
+    from_package: &str,
+    to_package: &str,
+    dependency_relations: &[String],
+    call_refs: &[rpeek::index::IndexedCallRef],
+    files: &[IndexedFile],
+    topics: &[IndexedTopic],
+    vignettes: &[IndexedVignette],
+) -> Value {
+    const SAMPLE_LIMIT: usize = 20;
+
+    let namespace = files
+        .iter()
+        .find(|file| file.path.eq_ignore_ascii_case("NAMESPACE"));
+    let namespace_import_all = namespace
+        .map(|file| namespace_imports_all(&file.text, to_package))
+        .unwrap_or(false);
+    let namespace_imports = namespace
+        .map(|file| namespace_imported_symbols(&file.text, to_package))
+        .unwrap_or_default();
+    let symbol_refs = call_refs
+        .iter()
+        .filter(|call_ref| call_ref.callee_package.as_deref() == Some(to_package))
+        .map(call_ref_json)
+        .collect::<Vec<_>>();
+    let file_mentions = collect_package_mentions_in_files(files, to_package);
+    let topic_mentions = collect_package_mentions_in_topics(topics, to_package);
+    let vignette_mentions = collect_package_mentions_in_vignettes(vignettes, to_package);
+
+    json!({
+        "from_package": from_package,
+        "to_package": to_package,
+        "dependency_relations": dependency_relations,
+        "namespace_import_all": namespace_import_all,
+        "namespace_imports": namespace_imports.into_iter().take(SAMPLE_LIMIT).collect::<Vec<_>>(),
+        "symbol_refs": symbol_refs.into_iter().take(SAMPLE_LIMIT).collect::<Vec<_>>(),
+        "mention_counts": {
+            "files": file_mentions.len(),
+            "topics": topic_mentions.len(),
+            "vignettes": vignette_mentions.len(),
+        },
+        "file_mentions": file_mentions.into_iter().take(SAMPLE_LIMIT).collect::<Vec<_>>(),
+        "topic_mentions": topic_mentions.into_iter().take(SAMPLE_LIMIT).collect::<Vec<_>>(),
+        "vignette_mentions": vignette_mentions.into_iter().take(SAMPLE_LIMIT).collect::<Vec<_>>(),
+    })
+}
+
+fn call_ref_json(call_ref: &rpeek::index::IndexedCallRef) -> Value {
+    json!({
+        "package": call_ref.package,
+        "path": call_ref.file_path,
+        "line": call_ref.line_number,
+        "caller_symbol": call_ref.caller_symbol,
+        "callee_package": call_ref.callee_package,
+        "callee_symbol": call_ref.callee_symbol,
+        "relation": call_ref.relation,
+        "text": call_ref.snippet,
+    })
+}
+
+fn collect_symbol_mentions(
+    symbol: &str,
+    files: &[IndexedFile],
+    topics: &[IndexedTopic],
+    vignettes: &[IndexedVignette],
+) -> Value {
+    json!({
+        "files": files
+            .iter()
+            .filter_map(|file| first_line_with_symbol(&file.text, symbol).map(|line| {
+                json!({
+                    "path": file.path,
+                    "line": line,
+                })
+            }))
+            .take(20)
+            .collect::<Vec<_>>(),
+        "topics": topics
+            .iter()
+            .filter(|topic| {
+                topic.topic == symbol
+                    || topic.aliases.iter().any(|alias| alias == symbol)
+                    || topic.text.as_deref().is_some_and(|text| contains_symbol_name(text, symbol))
+            })
+            .map(|topic| {
+                json!({
+                    "topic": topic.topic,
+                    "title": topic.title,
+                })
+            })
+            .take(20)
+            .collect::<Vec<_>>(),
+        "vignettes": vignettes
+            .iter()
+            .filter(|vignette| vignette.text.as_deref().is_some_and(|text| contains_symbol_name(text, symbol)))
+            .map(|vignette| {
+                json!({
+                    "topic": vignette.topic,
+                    "title": vignette.title,
+                })
+            })
+            .take(20)
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn build_indexed_package_record(
+    package: &str,
+    helper: &mut HelperProcess,
+    socket: &Path,
+) -> Result<IndexedPackageRecord> {
+    let package_json = query_helper_payload(
+        helper,
+        socket,
+        &Request::Pkg {
+            package: package.to_string(),
+        },
+    )?;
+    let install_path = PathBuf::from(required_string(&package_json, "install_path")?);
+    let version = optional_string(&package_json, "version");
+    let title = optional_string(&package_json, "title");
+    let exports = string_list(&package_json, "exports");
+
+    let objects_payload = query_helper_payload(
+        helper,
+        socket,
+        &Request::Objects {
+            package: package.to_string(),
+        },
+    )?;
+    let objects = string_list(&objects_payload, "objects");
+
+    let signatures_payload = query_helper_payload(
+        helper,
+        socket,
+        &Request::Sigs {
+            package: package.to_string(),
+            all_objects: false,
+        },
+    )?;
+    let signatures_json = signatures_payload
+        .get("signatures")
+        .cloned()
+        .unwrap_or(Value::Array(Vec::new()));
+
+    let topics_payload = query_helper_payload(
+        helper,
+        socket,
+        &Request::Topics {
+            package: package.to_string(),
+        },
+    )?;
+    let topic_names = string_list(&topics_payload, "topics");
+    let mut topics = Vec::new();
+    for topic in topic_names {
+        let doc_payload = query_helper_payload(
+            helper,
+            socket,
+            &Request::Doc {
+                package: package.to_string(),
+                topic,
+            },
+        );
+        if let Ok(doc_payload) = doc_payload {
+            topics.push(indexed_topic_from_payload(&doc_payload));
+        }
+    }
+
+    let vignette_payload = query_helper_payload(
+        helper,
+        socket,
+        &Request::Vignettes {
+            package: package.to_string(),
+        },
+    )?;
+    let vignette_topics = vignette_payload
+        .get("vignettes")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row.get("topic").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut vignettes = Vec::new();
+    for topic in vignette_topics {
+        let payload = query_helper_payload(
+            helper,
+            socket,
+            &Request::Vignette {
+                package: package.to_string(),
+                name: topic,
+            },
+        );
+        if let Ok(payload) = payload {
+            vignettes.push(indexed_vignette_from_payload(&payload));
+        }
+    }
+
+    let files = collect_indexed_files(&install_path)?;
+
+    Ok(IndexedPackageRecord {
+        package: package.to_string(),
+        version,
+        title,
+        install_path,
+        package_json,
+        exports,
+        objects,
+        signatures_json,
+        topics,
+        vignettes,
+        files,
+        indexed_at: now_timestamp()?,
+    })
+}
+
+fn indexed_topic_from_payload(payload: &Value) -> IndexedTopic {
+    IndexedTopic {
+        topic: payload
+            .get("topic")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        title: optional_string(payload, "title"),
+        aliases: string_list(payload, "aliases"),
+        description: optional_string(payload, "description"),
+        usage: optional_string(payload, "usage"),
+        value: optional_string(payload, "value"),
+        examples: optional_string(payload, "examples"),
+        text: optional_string(payload, "text"),
+    }
+}
+
+fn indexed_vignette_from_payload(payload: &Value) -> IndexedVignette {
+    let paths = payload.get("paths").cloned().unwrap_or(Value::Null);
+    IndexedVignette {
+        topic: payload
+            .get("topic")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        title: optional_string(payload, "title"),
+        source_path: optional_string(&paths, "source"),
+        r_path: optional_string(&paths, "r"),
+        pdf_path: optional_string(&paths, "pdf"),
+        text_kind: optional_string(payload, "text_kind"),
+        text: optional_string(payload, "text"),
+    }
+}
+
+fn collect_indexed_files(install_path: &Path) -> Result<Vec<IndexedFile>> {
+    let mut files = Vec::new();
+    collect_indexed_files_from_dir(install_path, install_path, &mut files)?;
+    Ok(files)
+}
+
+fn collect_indexed_files_from_dir(
+    root: &Path,
+    dir: &Path,
+    out: &mut Vec<IndexedFile>,
+) -> Result<()> {
+    let mut entries = fs::read_dir(dir)
+        .with_context(|| format!("failed to read package directory {}", dir.display()))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("failed to scan package directory {}", dir.display()))?;
+    entries.sort_by_key(|entry| entry.path());
+
+    for entry in entries {
+        let path = entry.path();
+        let metadata = entry
+            .metadata()
+            .with_context(|| format!("failed to stat {}", path.display()))?;
+        if metadata.is_dir() {
+            collect_indexed_files_from_dir(root, &path, out)?;
+            continue;
+        }
+
+        let rel_path = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if !should_index_file(&rel_path, &metadata) {
+            continue;
+        }
+        if let Some(file) = read_indexed_file(&path, &rel_path)? {
+            out.push(file);
+        }
+    }
+
+    Ok(())
+}
+
+fn should_index_file(rel_path: &str, metadata: &fs::Metadata) -> bool {
+    if metadata.len() > INDEX_TEXT_FILE_LIMIT {
+        return false;
+    }
+
+    let rel_lower = rel_path.to_ascii_lowercase();
+    let file_name = Path::new(rel_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let extension = Path::new(rel_path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let top_level = rel_lower.split('/').next().unwrap_or_default();
+
+    let top_level_allowed = matches!(
+        top_level,
+        "r" | "demo" | "doc" | "tests" | "testthat" | "inst"
+    );
+    let top_file_allowed = matches!(
+        file_name.as_str(),
+        "description"
+            | "namespace"
+            | "index"
+            | "readme"
+            | "readme.md"
+            | "news"
+            | "news.md"
+            | "news.txt"
+            | "changelog"
+            | "changelog.md"
+            | "citation"
+            | "license"
+            | "authors"
+    );
+    let extension_allowed = matches!(
+        extension.as_str(),
+        "r" | "rd"
+            | "rmd"
+            | "qmd"
+            | "rnw"
+            | "md"
+            | "txt"
+            | "html"
+            | "htm"
+            | "csv"
+            | "tsv"
+            | "json"
+            | "yaml"
+            | "yml"
+            | "xml"
+    );
+
+    (top_level_allowed && extension_allowed) || top_file_allowed
+}
+
+fn read_indexed_file(path: &Path, rel_path: &str) -> Result<Option<IndexedFile>> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if bytes.contains(&0) {
+        return Ok(None);
+    }
+
+    let text = String::from_utf8_lossy(&bytes).trim().to_string();
+    if text.is_empty() {
+        return Ok(None);
+    }
+
+    let text_kind = Path::new(rel_path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("text")
+        .to_ascii_lowercase();
+
+    Ok(Some(IndexedFile {
+        path: rel_path.to_string(),
+        text_kind,
+        text,
+    }))
+}
+
+fn string_list(value: &Value, key: &str) -> Vec<String> {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn optional_string(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn required_string(value: &Value, key: &str) -> Result<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("helper payload missing required field '{key}'"))
+}
+
+fn indexed_search_payload(
+    package_data: &IndexedPackageData,
+    topics: &[IndexedTopic],
+    query: &str,
+    kind: &str,
+    limit: usize,
+) -> Value {
+    let limit = limit.max(1).min(100);
+    let query_lower = query.to_ascii_lowercase();
+    let exports = &package_data.exports;
+
+    let object_matches = if matches!(kind, "all" | "object") {
+        ranked_matches(
+            &package_data.objects,
+            &query_lower,
+            limit,
+            |name, matched_by| {
+                json!({
+                    "kind": "object",
+                    "name": name,
+                    "exported": exports.iter().any(|exported| exported == name),
+                    "matched_by": matched_by,
+                })
+            },
+        )
+    } else {
+        RankedMatches::empty()
+    };
+
+    let topic_names = topics
+        .iter()
+        .map(|topic| topic.topic.as_str())
+        .collect::<Vec<_>>();
+    let topic_matches = if matches!(kind, "all" | "topic") {
+        ranked_matches(&topic_names, &query_lower, limit, |topic, matched_by| {
+            json!({
+                "kind": "topic",
+                "topic": topic,
+                "matched_by": matched_by,
+            })
+        })
+    } else {
+        RankedMatches::empty()
+    };
+
+    let mut matches = Vec::new();
+    matches.extend(object_matches.matches);
+    matches.extend(topic_matches.matches);
+    matches.sort_by_cached_key(|entry| {
+        let label = entry
+            .get("name")
+            .or_else(|| entry.get("topic"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        rank_tuple(&label, &query_lower)
+    });
+    matches.truncate(limit);
+
+    json!({
+        "package": package_data.package,
+        "query": query,
+        "kind": kind,
+        "limit": limit,
+        "matches": matches,
+        "counts": {
+            "objects": object_matches.total,
+            "topics": topic_matches.total,
+        }
+    })
+}
+
+fn indexed_map_payload(
+    package_data: &IndexedPackageData,
+    topics: &[IndexedTopic],
+    vignettes: &[IndexedVignette],
+    files: &[IndexedFile],
+) -> Value {
+    const EXPORT_SAMPLE_LIMIT: usize = 24;
+    const TOPIC_SAMPLE_LIMIT: usize = 20;
+    const ENTRY_POINT_LIMIT: usize = 12;
+    const FILE_SAMPLE_LIMIT: usize = 12;
+
+    let dependencies = json!({
+        "depends": string_list(&package_data.package_json, "depends"),
+        "imports": string_list(&package_data.package_json, "imports"),
+        "suggests": string_list(&package_data.package_json, "suggests"),
+        "linking_to": string_list(&package_data.package_json, "linking_to"),
+    });
+
+    let startup_hooks = package_data
+        .objects
+        .iter()
+        .filter(|name| {
+            matches!(
+                name.as_str(),
+                ".onLoad" | ".onAttach" | ".onUnload" | ".onDetach"
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let entry_points = package_data
+        .signatures_json
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(ENTRY_POINT_LIMIT)
+        .filter_map(|entry| {
+            Some(json!({
+                "name": entry.get("name")?.as_str()?,
+                "signature": entry.get("signature")?.as_str()?,
+            }))
+        })
+        .collect::<Vec<_>>();
+
+    let topic_samples = topics
+        .iter()
+        .take(TOPIC_SAMPLE_LIMIT)
+        .map(|topic| {
+            json!({
+                "topic": topic.topic,
+                "title": topic.title,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let file_samples = indexed_map_file_samples(package_data, files, FILE_SAMPLE_LIMIT);
+    let exports_sample = package_data
+        .exports
+        .iter()
+        .take(EXPORT_SAMPLE_LIMIT)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    json!({
+        "package": package_data.package,
+        "version": package_data.version,
+        "title": optional_string(&package_data.package_json, "title"),
+        "description": optional_string(&package_data.package_json, "description"),
+        "install_path": package_data.install_path.display().to_string(),
+        "counts": {
+            "exports": package_data.exports.len(),
+            "objects": package_data.objects.len(),
+            "signatures": package_data.signatures_json.as_array().map(Vec::len).unwrap_or_default(),
+            "topics": topics.len(),
+            "vignettes": vignettes.len(),
+        },
+        "dependencies": dependencies,
+        "startup_hooks": startup_hooks,
+        "entry_points": entry_points,
+        "exports_sample": exports_sample,
+        "topic_samples": topic_samples,
+        "vignettes": vignettes.iter().cloned().map(vignette_listing_json).collect::<Vec<_>>(),
+        "file_samples": file_samples,
+        "drill_down": [
+            format!("rpeek search {} <query>", package_data.package),
+            format!("rpeek sigs {}", package_data.package),
+            format!("rpeek summary {} <object>", package_data.package),
+            format!("rpeek index search {} <query>", package_data.package),
+        ],
+    })
+}
+
+fn indexed_search_vignettes_payload(
+    package: &str,
+    vignettes: &[IndexedVignette],
+    query: &str,
+    limit: usize,
+) -> Value {
+    let limit = limit.max(1).min(200);
+    let mut matches = Vec::new();
+    let mut scanned_files = 0usize;
+    let mut truncated = false;
+
+    for vignette in vignettes {
+        if matches.len() >= limit {
+            truncated = true;
+            break;
+        }
+
+        if vignette_metadata_matches(vignette, query) {
+            matches.push(json!({
+                "topic": vignette.topic,
+                "title": vignette.title,
+                "matched_in": "metadata",
+                "path": vignette.source_path.as_ref().or(vignette.r_path.as_ref()),
+                "line": Value::Null,
+                "text": Value::Null,
+            }));
+        }
+
+        if matches.len() >= limit {
+            truncated = true;
+            break;
+        }
+
+        if let Some(text) = &vignette.text {
+            scanned_files += 1;
+            for (idx, line) in text.lines().enumerate() {
+                if !contains_ignore_case(line, query) {
+                    continue;
+                }
+                matches.push(json!({
+                    "topic": vignette.topic,
+                    "title": vignette.title,
+                    "matched_in": "content",
+                    "path": vignette.source_path.as_ref().or(vignette.r_path.as_ref()),
+                    "line": idx + 1,
+                    "text": line,
+                }));
+                if matches.len() >= limit {
+                    truncated = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    json!({
+        "package": package,
+        "query": query,
+        "limit": limit,
+        "counts": {
+            "vignettes": vignettes.len(),
+            "scanned_files": scanned_files,
+        },
+        "matches": matches,
+        "truncated": truncated,
+    })
+}
+
+fn vignette_listing_json(vignette: IndexedVignette) -> Value {
+    json!({
+        "topic": vignette.topic,
+        "title": vignette.title,
+        "file": basename_from_path(vignette.source_path.as_deref()),
+        "r": basename_from_path(vignette.r_path.as_deref()),
+        "pdf": basename_from_path(vignette.pdf_path.as_deref()),
+        "paths": {
+            "source": vignette.source_path,
+            "r": vignette.r_path,
+            "pdf": vignette.pdf_path,
+        }
+    })
+}
+
+fn vignette_detail_json(package: &str, vignette: &IndexedVignette) -> Value {
+    json!({
+        "package": package,
+        "topic": vignette.topic,
+        "title": vignette.title,
+        "file": basename_from_path(vignette.source_path.as_deref()),
+        "r": basename_from_path(vignette.r_path.as_deref()),
+        "pdf": basename_from_path(vignette.pdf_path.as_deref()),
+        "paths": {
+            "source": vignette.source_path,
+            "r": vignette.r_path,
+            "pdf": vignette.pdf_path,
+        },
+        "text": vignette.text,
+        "text_path": vignette.source_path.as_ref().or(vignette.r_path.as_ref()),
+        "text_kind": vignette.text_kind,
+    })
+}
+
+fn match_vignette(vignettes: &[IndexedVignette], name: &str) -> Option<IndexedVignette> {
+    let lowered = name.to_ascii_lowercase();
+    let exact = vignettes
+        .iter()
+        .find(|vignette| vignette.topic.eq_ignore_ascii_case(name))
+        .cloned();
+    if exact.is_some() {
+        return exact;
+    }
+
+    let candidates = vignettes
+        .iter()
+        .filter(|vignette| {
+            vignette
+                .title
+                .as_deref()
+                .is_some_and(|title| title.eq_ignore_ascii_case(name))
+                || basename_from_path(vignette.source_path.as_deref())
+                    .as_deref()
+                    .is_some_and(|file| file.eq_ignore_ascii_case(name))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if candidates.len() == 1 {
+        return candidates.into_iter().next();
+    }
+
+    let contains = vignettes
+        .iter()
+        .filter(|vignette| {
+            contains_ignore_case(&vignette.topic, &lowered)
+                || vignette
+                    .title
+                    .as_deref()
+                    .is_some_and(|title| contains_ignore_case(title, &lowered))
+                || basename_from_path(vignette.source_path.as_deref())
+                    .as_deref()
+                    .is_some_and(|file| contains_ignore_case(file, &lowered))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if contains.len() == 1 {
+        return contains.into_iter().next();
+    }
+
+    None
+}
+
+fn vignette_metadata_matches(vignette: &IndexedVignette, query: &str) -> bool {
+    contains_ignore_case(&vignette.topic, query)
+        || vignette
+            .title
+            .as_deref()
+            .is_some_and(|title| contains_ignore_case(title, query))
+        || vignette
+            .source_path
+            .as_deref()
+            .is_some_and(|path| contains_ignore_case(path, query))
+        || vignette
+            .r_path
+            .as_deref()
+            .is_some_and(|path| contains_ignore_case(path, query))
+}
+
+fn basename_from_path(path: Option<&str>) -> Option<String> {
+    path.and_then(|value| {
+        Path::new(value)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+    })
+}
+
+fn indexed_map_file_samples(
+    package_data: &IndexedPackageData,
+    files: &[IndexedFile],
+    limit: usize,
+) -> Vec<Value> {
+    let install_path = package_data.install_path.display().to_string();
+    let mut ranked = files.to_vec();
+    ranked.sort_by_cached_key(|file| map_file_rank(&file.path));
+    ranked
+        .into_iter()
+        .take(limit)
+        .map(|file| {
+            json!({
+                "path": file.path,
+                "kind": file.text_kind,
+                "absolute_path": format!("{install_path}/{}", file.path),
+            })
+        })
+        .collect()
+}
+
+fn map_file_rank(path: &str) -> (u8, u8, String) {
+    let lower = path.to_ascii_lowercase();
+    let group = if lower == "description" {
+        0
+    } else if lower == "namespace" {
+        1
+    } else if lower == "index" {
+        2
+    } else if lower.starts_with("doc/") {
+        3
+    } else if lower.starts_with("tests/") || lower.starts_with("testthat/") {
+        4
+    } else if lower.starts_with("r/") {
+        5
+    } else if lower.starts_with("inst/") {
+        6
+    } else {
+        7
+    };
+    let depth = lower.matches('/').count() as u8;
+    (group, depth, lower)
+}
+
+#[derive(Default)]
+struct RankedMatches {
+    matches: Vec<Value>,
+    total: usize,
+}
+
+impl RankedMatches {
+    fn empty() -> Self {
+        Self::default()
+    }
+}
+
+fn ranked_matches<F>(
+    candidates: &[impl AsRef<str>],
+    query_lower: &str,
+    limit: usize,
+    builder: F,
+) -> RankedMatches
+where
+    F: Fn(&str, &str) -> Value,
+{
+    let labels = candidates
+        .iter()
+        .map(|candidate| candidate.as_ref().trim())
+        .filter(|candidate| !candidate.is_empty())
+        .collect::<Vec<_>>();
+    if labels.is_empty() {
+        return RankedMatches::empty();
+    }
+
+    let substring = labels
+        .iter()
+        .copied()
+        .filter(|label| contains_ignore_case(label, query_lower))
+        .collect::<Vec<_>>();
+    let (pool, matched_by) = if substring.is_empty() {
+        let mut ranked = labels;
+        ranked.sort_by_cached_key(|label| rank_tuple(label, query_lower));
+        (
+            ranked
+                .into_iter()
+                .take(limit.saturating_mul(3).max(limit))
+                .collect::<Vec<_>>(),
+            "fuzzy",
+        )
+    } else {
+        (substring, "substring")
+    };
+
+    let mut ranked = pool;
+    ranked.sort_by_cached_key(|label| rank_tuple(label, query_lower));
+    RankedMatches {
+        total: ranked.len(),
+        matches: ranked
+            .into_iter()
+            .take(limit)
+            .map(|label| builder(label, matched_by))
+            .collect(),
+    }
+}
+
+fn rank_tuple(label: &str, query: &str) -> (u8, u8, u8, usize, usize, String) {
+    let lowered = label.to_ascii_lowercase();
+    (
+        (!lowered.eq(query)) as u8,
+        (!lowered.starts_with(query)) as u8,
+        (!lowered.contains(query)) as u8,
+        levenshtein(query, &lowered),
+        label.len(),
+        lowered,
+    )
+}
+
+fn contains_ignore_case(text: &str, query: &str) -> bool {
+    text.to_ascii_lowercase()
+        .contains(&query.to_ascii_lowercase())
+}
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    if a == b {
+        return 0;
+    }
+    if a.is_empty() {
+        return b.chars().count();
+    }
+    if b.is_empty() {
+        return a.chars().count();
+    }
+
+    let b_chars = b.chars().collect::<Vec<_>>();
+    let mut prev = (0..=b_chars.len()).collect::<Vec<_>>();
+    let mut curr = vec![0; b_chars.len() + 1];
+
+    for (i, a_char) in a.chars().enumerate() {
+        curr[0] = i + 1;
+        for (j, b_char) in b_chars.iter().enumerate() {
+            let cost = usize::from(a_char != *b_char);
+            curr[j + 1] = (curr[j] + 1).min(prev[j + 1] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+
+    prev[b_chars.len()]
 }
 
 fn batch_response(file: Option<PathBuf>, options: &ResponseOptions) -> Result<Value> {
@@ -1022,6 +3112,7 @@ struct CacheKey {
 struct PackageState {
     install_path: PathBuf,
     fingerprint: String,
+    helper_fingerprint: Option<String>,
 }
 
 enum FingerprintResolution {
@@ -1033,32 +3124,32 @@ struct ResponseCache {
     entries: HashMap<CacheKey, String>,
     order: VecDeque<CacheKey>,
     packages: HashMap<String, PackageState>,
+    index: IndexStore,
     hits: u64,
     misses: u64,
     invalidations: u64,
     max_entries: usize,
 }
 
-impl Default for ResponseCache {
-    fn default() -> Self {
+impl ResponseCache {
+    fn new() -> Result<Self> {
         let max_entries = env::var("RPEEK_CACHE_ENTRIES")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(512);
-        Self {
+        Ok(Self {
             entries: HashMap::new(),
             order: VecDeque::new(),
             packages: HashMap::new(),
+            index: IndexStore::open_default()?,
             hits: 0,
             misses: 0,
             invalidations: 0,
             max_entries,
-        }
+        })
     }
-}
 
-impl ResponseCache {
     fn get(&mut self, key: &CacheKey) -> Option<String> {
         let response = self.entries.get(key).cloned();
         if response.is_some() {
@@ -1122,6 +3213,23 @@ impl ResponseCache {
         })
     }
 
+    fn index_payload(&self) -> Value {
+        match self.index.stats() {
+            Ok(stats) => json!({
+                "path": stats.path.display().to_string(),
+                "schema_version": stats.schema_version,
+                "packages": stats.package_count,
+                "indexed_packages": stats.indexed_packages,
+                "topics": stats.topic_count,
+                "vignettes": stats.vignette_count,
+                "files": stats.file_count
+            }),
+            Err(err) => json!({
+                "error": err.to_string()
+            }),
+        }
+    }
+
     fn stats_response(&self) -> String {
         json!({
             "schema_version": 1,
@@ -1137,21 +3245,60 @@ impl ResponseCache {
         helper: &mut HelperProcess,
         socket: &Path,
     ) -> Result<FingerprintResolution> {
-        if let Some(state) = self.packages.get_mut(package) {
-            let latest = package_fingerprint(&state.install_path)?;
-            if latest != state.fingerprint {
-                state.fingerprint = latest.clone();
-                self.entries
-                    .retain(|key, _| key.request.package() != Some(package));
-                self.order
-                    .retain(|key| key.request.package() != Some(package));
-                self.invalidations += 1;
+        if let Some(state) = self.packages.get(package) {
+            if state.install_path.exists() {
+                let latest = package_fingerprint(&state.install_path)?;
+                if latest == state.fingerprint {
+                    return Ok(FingerprintResolution::Fingerprint(
+                        state.fingerprint.clone(),
+                    ));
+                }
             }
-            return Ok(FingerprintResolution::Fingerprint(
-                state.fingerprint.clone(),
-            ));
+
+            let helper_fingerprint = state.helper_fingerprint.clone();
+            self.invalidate_package(package);
+            return self.refresh_package_state(package, helper_fingerprint, helper, socket);
         }
 
+        if let Some(state) = self.index.get_package_state(package)? {
+            if state.install_path.exists() {
+                let latest = package_fingerprint(&state.install_path)?;
+                if latest == state.local_fingerprint {
+                    self.packages.insert(
+                        package.to_string(),
+                        PackageState {
+                            install_path: state.install_path,
+                            fingerprint: latest.clone(),
+                            helper_fingerprint: state.helper_fingerprint,
+                        },
+                    );
+                    return Ok(FingerprintResolution::Fingerprint(latest));
+                }
+            }
+
+            self.invalidate_package(package);
+            return self.refresh_package_state(package, state.helper_fingerprint, helper, socket);
+        }
+
+        self.refresh_package_state(package, None, helper, socket)
+    }
+
+    fn invalidate_package(&mut self, package: &str) {
+        self.entries
+            .retain(|key, _| key.request.package() != Some(package));
+        self.order
+            .retain(|key| key.request.package() != Some(package));
+        self.packages.remove(package);
+        self.invalidations += 1;
+    }
+
+    fn refresh_package_state(
+        &mut self,
+        package: &str,
+        prior_helper_fingerprint: Option<String>,
+        helper: &mut HelperProcess,
+        socket: &Path,
+    ) -> Result<FingerprintResolution> {
         let fingerprint_request = Request::Fingerprint {
             package: package.to_string(),
         };
@@ -1165,36 +3312,126 @@ impl ResponseCache {
         if !response_reports_success(&value) {
             return Ok(FingerprintResolution::ErrorResponse(response));
         }
-        let install_path = value
+        let payload = value
             .get("payload")
-            .and_then(|payload| payload.get("install_path"))
+            .ok_or_else(|| anyhow!("fingerprint response missing payload"))?;
+        let install_path = payload
+            .get("install_path")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("fingerprint response missing install_path"))?;
+        let helper_fingerprint = payload
+            .get("version")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or(prior_helper_fingerprint);
         let install_path = PathBuf::from(install_path);
         let fingerprint = package_fingerprint(&install_path)?;
+        let state = PackageState {
+            install_path: install_path.clone(),
+            fingerprint: fingerprint.clone(),
+            helper_fingerprint: helper_fingerprint.clone(),
+        };
+        self.packages.insert(package.to_string(), state);
+        self.index.upsert_package_state(&PackageIndexState {
+            package: package.to_string(),
+            install_path,
+            helper_fingerprint,
+            local_fingerprint: fingerprint.clone(),
+            updated_at: now_timestamp()?,
+        })?;
 
+        Ok(FingerprintResolution::Fingerprint(fingerprint))
+    }
+
+    fn ensure_indexed_package(
+        &mut self,
+        package: &str,
+        fingerprint: &str,
+        helper: &mut HelperProcess,
+        socket: &Path,
+    ) -> Result<()> {
+        let state = self.index.get_package_state(package)?;
+        let summary = self.index.get_indexed_package_summary(package)?;
+        if let (Some(state), Some(_)) = (state, summary)
+            && state.local_fingerprint == fingerprint
+        {
+            return Ok(());
+        }
+
+        let record = build_indexed_package_record(package, helper, socket)?;
+        let helper_fingerprint = record.version.clone();
+        let install_path = record.install_path.clone();
+        self.index.upsert_package_record(&record)?;
+        self.index.upsert_package_state(&PackageIndexState {
+            package: package.to_string(),
+            install_path: install_path.clone(),
+            helper_fingerprint: helper_fingerprint.clone(),
+            local_fingerprint: fingerprint.to_string(),
+            updated_at: record.indexed_at,
+        })?;
         self.packages.insert(
             package.to_string(),
             PackageState {
                 install_path,
-                fingerprint: fingerprint.clone(),
+                fingerprint: fingerprint.to_string(),
+                helper_fingerprint,
             },
         );
+        Ok(())
+    }
 
-        Ok(FingerprintResolution::Fingerprint(fingerprint))
+    fn indexed_response(&self, request: &Request) -> Result<Option<String>> {
+        indexed_request_response(self, request)
     }
 }
 
 fn package_fingerprint(install_path: &Path) -> Result<String> {
     let description = file_fingerprint(&install_path.join("DESCRIPTION"))?;
     let namespace = file_fingerprint(&install_path.join("NAMESPACE"))?;
+    let meta = path_fingerprint(&install_path.join("Meta"))?;
     let help = path_fingerprint(&install_path.join("help"))?;
+    let doc = path_fingerprint(&install_path.join("doc"))?;
     let r_dir = path_fingerprint(&install_path.join("R"))?;
 
     Ok(format!(
-        "{}|description:{description}|namespace:{namespace}|help:{help}|r:{r_dir}",
+        "{}|description:{description}|namespace:{namespace}|meta:{meta}|help:{help}|doc:{doc}|r:{r_dir}",
         install_path.display()
     ))
+}
+
+fn index_status_response() -> Result<Value> {
+    let store = IndexStore::open_default()?;
+    let stats = store.stats()?;
+    Ok(json!({
+        "schema_version": 1,
+        "ok": true,
+        "command": "index_status",
+        "payload": {
+            "path": stats.path.display().to_string(),
+            "schema_version": stats.schema_version,
+            "packages": stats.package_count,
+            "indexed_packages": stats.indexed_packages,
+            "topics": stats.topic_count,
+            "vignettes": stats.vignette_count,
+            "files": stats.file_count,
+            "snippets": stats.snippet_count
+        }
+    }))
+}
+
+fn index_clear_response() -> Result<Value> {
+    let store = IndexStore::open_default()?;
+    let path = store.path().display().to_string();
+    let cleared_packages = store.clear()?;
+    Ok(json!({
+        "schema_version": 1,
+        "ok": true,
+        "command": "index_clear",
+        "payload": {
+            "path": path,
+            "cleared_packages": cleared_packages
+        }
+    }))
 }
 
 fn file_fingerprint(path: &Path) -> Result<String> {

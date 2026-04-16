@@ -17,9 +17,15 @@
         "resolve",
         "summary",
         "sig",
+        "map",
+        "sigs",
         "source",
         "doc",
+        "topics",
         "methods",
+        "vignettes",
+        "vignette",
+        "search_vignettes",
         "files",
         "grep",
         "cache_clear",
@@ -40,7 +46,8 @@
       "type": "integer",
       "minimum": 1
     },
-    "glob": { "type": "string" }
+    "glob": { "type": "string" },
+    "all_objects": { "type": "boolean" }
   },
   "additionalProperties": false
 }

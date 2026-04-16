@@ -4,6 +4,7 @@
 //! exposes a compact Rust API for callers that need to:
 //!
 //! - construct typed requests for the CLI/daemon/helper protocol
+//! - inspect or query the persistent package index
 //! - apply the same response-shaping rules used by the CLI
 //! - retrieve the embedded request and response schemas
 //!
@@ -14,7 +15,7 @@
 //! # Getting Started
 //!
 //! Most Rust consumers start with [`Request`], then optionally use [`ResponseOptions`]
-//! to shape parsed JSON responses.
+//! and [`IndexStore`] to shape parsed JSON responses or inspect the persistent index.
 //!
 //! ```
 //! use rpeek::{Request, ResponseOptions, apply_response_options};
@@ -56,6 +57,10 @@
 //! [`Request`]
 //! : The typed wire-format enum used by the CLI, daemon, and R helper.
 //!
+//! [`IndexStore`]
+//! : Opens the persistent SQLite index and exposes package summaries, indexed content,
+//! and snippet/document search helpers.
+//!
 //! [`ResponseOptions`], [`apply_response_options`], [`response_exit_code`]
 //! : Mirror the output-shaping and success/exit-code logic used by the CLI.
 //!
@@ -65,6 +70,8 @@
 //!
 //! # Module Guide
 //!
+//! - [`index`]: persistent index storage, summaries, snippet records, and FTS-backed
+//!   search
 //! - [`protocol`]: request types and request metadata helpers such as
 //!   [`Request::action`] and [`Request::package`]
 //! - [`response`]: response trimming, example removal, and success/exit-code helpers
@@ -82,10 +89,16 @@
 //! cargo doc --no-deps --open
 //! ```
 
+pub mod index;
 pub mod protocol;
 pub mod response;
 pub mod schema;
 
+pub use index::{
+    IndexStats, IndexStore, IndexedCallRef, IndexedFile, IndexedMethod, IndexedPackageData,
+    IndexedPackageLink, IndexedPackageRecord, IndexedPackageSummary, IndexedSnippet, IndexedTopic,
+    IndexedVignette, NewSnippet, PackageIndexState, default_index_path,
+};
 pub use protocol::Request;
 pub use response::{
     ResponseOptions, apply_response_options, response_exit_code, response_is_success,

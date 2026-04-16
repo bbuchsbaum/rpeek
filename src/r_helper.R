@@ -79,6 +79,20 @@ all_object_names <- function(package) {
   sort(ls(asNamespace(package), all.names = TRUE))
 }
 
+all_help_topics <- function(package) {
+  alias_map <- package_alias_map(package)
+  sort(unique(c(names(alias_map), unname(alias_map))))
+}
+
+canonical_help_topics <- function(package) {
+  alias_map <- package_alias_map(package)
+  topics <- sort(unique(unname(alias_map)))
+  if (!length(topics)) {
+    return(all_help_topics(package))
+  }
+  topics
+}
+
 installed_package_info <- function() {
   info <- utils::installed.packages()[, c("Package", "LibPath"), drop = FALSE]
   info <- info[order(info[, "Package"]), , drop = FALSE]
@@ -460,6 +474,303 @@ list_files <- function(package) {
   )
 }
 
+vignette_topic_from_file <- function(path) {
+  sub("\\.[^.]+$", "", basename(path %||% ""))
+}
+
+vignette_index <- function(package) {
+  pkg_path <- normalize_package(package)
+  meta_path <- file.path(pkg_path, "Meta", "vignette.rds")
+  if (!file.exists(meta_path)) {
+    return(data.frame())
+  }
+
+  meta <- tryCatch(readRDS(meta_path), error = function(...) data.frame())
+  if (!is.data.frame(meta) || !nrow(meta)) {
+    return(data.frame())
+  }
+
+  if (!"File" %in% names(meta)) {
+    meta$File <- rep(NA_character_, nrow(meta))
+  }
+  if (!"Title" %in% names(meta)) {
+    meta$Title <- rep(NA_character_, nrow(meta))
+  }
+  if (!"R" %in% names(meta)) {
+    meta$R <- rep(NA_character_, nrow(meta))
+  }
+  if (!"PDF" %in% names(meta)) {
+    meta$PDF <- rep(NA_character_, nrow(meta))
+  }
+
+  topics <- vapply(meta$File, vignette_topic_from_file, character(1), USE.NAMES = FALSE)
+  doc_dir <- file.path(pkg_path, "doc")
+  file_paths <- file.path(doc_dir, meta$File)
+  r_paths <- file.path(doc_dir, meta$R)
+  pdf_paths <- file.path(doc_dir, meta$PDF)
+
+  data.frame(
+    Topic = topics,
+    Title = as.character(meta$Title),
+    File = as.character(meta$File),
+    R = as.character(meta$R),
+    PDF = as.character(meta$PDF),
+    FilePath = ifelse(file.exists(file_paths), file_paths, NA_character_),
+    RPath = ifelse(file.exists(r_paths), r_paths, NA_character_),
+    PDFPath = ifelse(file.exists(pdf_paths), pdf_paths, NA_character_),
+    stringsAsFactors = FALSE
+  )
+}
+
+vignette_records <- function(package) {
+  index <- vignette_index(package)
+  if (!nrow(index)) {
+    return(list())
+  }
+
+  lapply(seq_len(nrow(index)), function(i) {
+    list(
+      package = package,
+      topic = index$Topic[[i]],
+      title = index$Title[[i]],
+      file = index$File[[i]],
+      r = index$R[[i]],
+      pdf = index$PDF[[i]],
+      paths = list(
+        source = index$FilePath[[i]],
+        r = index$RPath[[i]],
+        pdf = index$PDFPath[[i]]
+      )
+    )
+  })
+}
+
+vignette_suggestions <- function(index, name) {
+  candidates <- unique(c(index$Topic, index$Title, index$File))
+  candidates <- candidates[!is.na(candidates) & nzchar(candidates)]
+  candidate_suggestions(candidates, name)
+}
+
+resolve_vignette_row <- function(package, name) {
+  index <- vignette_index(package)
+  if (!nrow(index)) {
+    rpkg_stop(
+      "vignette_not_found",
+      sprintf("package '%s' does not expose installed vignettes", package),
+      hint = sprintf("Try `rpeek files %s` to inspect installed documentation files.", package)
+    )
+  }
+
+  lowered <- tolower(name)
+  topic_match <- which(tolower(index$Topic) == lowered)
+  file_match <- which(tolower(index$File) == lowered)
+  title_match <- which(tolower(index$Title) == lowered)
+  base_match <- which(tolower(vapply(index$File, vignette_topic_from_file, character(1), USE.NAMES = FALSE)) == lowered)
+  idx <- unique(c(topic_match, file_match, title_match, base_match))
+  if (!length(idx)) {
+    contains <- which(
+      grepl(lowered, tolower(index$Topic), fixed = TRUE) |
+        grepl(lowered, tolower(index$Title), fixed = TRUE) |
+        grepl(lowered, tolower(index$File), fixed = TRUE)
+    )
+    if (length(contains) == 1) {
+      idx <- contains
+    }
+  }
+
+  if (!length(idx)) {
+    rpkg_stop(
+      "vignette_not_found",
+      sprintf("vignette '%s' not found in package '%s'", name, package),
+      suggestions = vignette_suggestions(index, name),
+      hint = sprintf("Try `rpeek vignettes %s` or `rpeek search-vignettes %s %s`.", package, package, name)
+    )
+  }
+
+  if (length(idx) > 1) {
+    rpkg_stop(
+      "vignette_ambiguous",
+      sprintf("vignette '%s' matched multiple installed vignettes in package '%s'", name, package),
+      suggestions = unique(index$Topic[idx]),
+      hint = sprintf("Use one of the exact topics from `rpeek vignettes %s`.", package)
+    )
+  }
+
+  index[idx[[1]], , drop = FALSE]
+}
+
+normalize_html_entities <- function(text) {
+  text <- gsub("&nbsp;", " ", text, fixed = TRUE)
+  text <- gsub("&lt;", "<", text, fixed = TRUE)
+  text <- gsub("&gt;", ">", text, fixed = TRUE)
+  text <- gsub("&amp;", "&", text, fixed = TRUE)
+  text <- gsub("&quot;", "\"", text, fixed = TRUE)
+  text
+}
+
+html_to_text <- function(text) {
+  text <- gsub("(?is)<script[^>]*>.*?</script>", " ", text, perl = TRUE)
+  text <- gsub("(?is)<style[^>]*>.*?</style>", " ", text, perl = TRUE)
+  text <- gsub("(?i)<br\\s*/?>", "\n", text, perl = TRUE)
+  text <- gsub("(?i)</(p|div|li|tr|h1|h2|h3|h4|h5|h6)>", "\n", text, perl = TRUE)
+  text <- gsub("(?s)<[^>]+>", " ", text, perl = TRUE)
+  text <- normalize_html_entities(text)
+  lines <- strsplit(text, "\n", fixed = TRUE)[[1]]
+  lines <- trimws(lines, which = "both")
+  lines <- trim_blank_edges(lines[nzchar(lines)])
+  paste(lines, collapse = "\n")
+}
+
+read_vignette_text_file <- function(path) {
+  ext <- tolower(tools::file_ext(path))
+  lines <- tryCatch(readLines(path, warn = FALSE, encoding = "UTF-8"), error = function(...) NULL)
+  if (is.null(lines)) {
+    return(NULL)
+  }
+  raw_text <- paste(lines, collapse = "\n")
+  text <- if (ext %in% c("html", "htm")) html_to_text(raw_text) else raw_text
+  list(
+    path = normalizePath(path, winslash = "/", mustWork = FALSE),
+    kind = ext %||% "text",
+    text = text,
+    lines = strsplit(text, "\n", fixed = TRUE)[[1]]
+  )
+}
+
+best_vignette_text <- function(row) {
+  candidates <- unique(na.omit(c(row$FilePath[[1]], row$RPath[[1]])))
+  preferred <- candidates[order(match(tolower(tools::file_ext(candidates)), c("rnw", "rmd", "qmd", "md", "r", "html", "htm", "txt"), nomatch = 999L))]
+  preferred <- preferred[!duplicated(preferred)]
+
+  for (path in preferred) {
+    text <- read_vignette_text_file(path)
+    if (!is.null(text) && nzchar(text$text)) {
+      return(text)
+    }
+  }
+
+  NULL
+}
+
+list_vignettes <- function(package) {
+  list(
+    package = package,
+    vignettes = vignette_records(package),
+    counts = list(vignettes = nrow(vignette_index(package)))
+  )
+}
+
+read_vignette <- function(package, name) {
+  row <- resolve_vignette_row(package, name)
+  text_source <- best_vignette_text(row)
+
+  list(
+    package = package,
+    topic = row$Topic[[1]],
+    title = row$Title[[1]],
+    file = row$File[[1]],
+    r = row$R[[1]],
+    pdf = row$PDF[[1]],
+    paths = list(
+      source = row$FilePath[[1]],
+      r = row$RPath[[1]],
+      pdf = row$PDFPath[[1]]
+    ),
+    text = text_source$text %||% NULL,
+    text_path = text_source$path %||% NULL,
+    text_kind = text_source$kind %||% NULL
+  )
+}
+
+search_vignette_text <- function(package, query, limit = 25) {
+  index <- vignette_index(package)
+  limit <- suppressWarnings(as.integer(limit))
+  if (is.na(limit) || limit < 1) {
+    limit <- 25
+  }
+  limit <- min(limit, 200)
+
+  matches <- list()
+  scanned_files <- 0L
+
+  if (!nrow(index)) {
+    return(list(
+      package = package,
+      query = query,
+      limit = limit,
+      counts = list(vignettes = 0, scanned_files = 0),
+      matches = matches,
+      truncated = FALSE
+    ))
+  }
+
+  for (i in seq_len(nrow(index))) {
+    topic <- index$Topic[[i]]
+    title <- index$Title[[i]]
+    file <- index$File[[i]]
+    metadata_fields <- c(topic, title, file)
+    if (any(grepl(query, metadata_fields, fixed = TRUE, ignore.case = TRUE), na.rm = TRUE)) {
+      matches[[length(matches) + 1L]] <- list(
+        topic = topic,
+        title = title,
+        matched_in = "metadata",
+        path = index$FilePath[[i]] %||% index$RPath[[i]],
+        line = NULL,
+        text = NULL
+      )
+      if (length(matches) >= limit) {
+        return(list(
+          package = package,
+          query = query,
+          limit = limit,
+          counts = list(vignettes = nrow(index), scanned_files = scanned_files),
+          matches = matches,
+          truncated = TRUE
+        ))
+      }
+    }
+
+    text_source <- best_vignette_text(index[i, , drop = FALSE])
+    if (is.null(text_source)) {
+      next
+    }
+    scanned_files <- scanned_files + 1L
+    line_hits <- grep(query, text_source$lines, fixed = TRUE, ignore.case = TRUE)
+    if (!length(line_hits)) {
+      next
+    }
+    for (line_no in line_hits) {
+      matches[[length(matches) + 1L]] <- list(
+        topic = topic,
+        title = title,
+        matched_in = "content",
+        path = text_source$path,
+        line = as.integer(line_no),
+        text = text_source$lines[[line_no]]
+      )
+      if (length(matches) >= limit) {
+        return(list(
+          package = package,
+          query = query,
+          limit = limit,
+          counts = list(vignettes = nrow(index), scanned_files = scanned_files),
+          matches = matches,
+          truncated = TRUE
+        ))
+      }
+    }
+  }
+
+  list(
+    package = package,
+    query = query,
+    limit = limit,
+    counts = list(vignettes = nrow(index), scanned_files = scanned_files),
+    matches = matches,
+    truncated = FALSE
+  )
+}
+
 object_info <- function(package, name) {
   info <- lookup_object(package, name)
   list(
@@ -470,6 +781,40 @@ object_info <- function(package, name) {
     class = as.character(info$class),
     mode = info$mode,
     signature = format_signature(info$object)
+  )
+}
+
+package_signatures <- function(package, all_objects = FALSE) {
+  normalize_package(package)
+  ns <- asNamespace(package)
+  object_names <- list_objects(package, exports_only = !isTRUE(all_objects))
+  exports <- getNamespaceExports(package)
+  signatures <- list()
+
+  for (name in object_names) {
+    obj <- tryCatch(get(name, envir = ns, inherits = FALSE), error = function(...) NULL)
+    if (!is.function(obj)) {
+      next
+    }
+    signatures[[length(signatures) + 1L]] <- list(
+      package = package,
+      name = name,
+      exported = name %in% exports,
+      type = typeof(obj),
+      class = as.character(class(obj)),
+      mode = mode(obj),
+      signature = format_signature(obj)
+    )
+  }
+
+  list(
+    package = package,
+    all_objects = isTRUE(all_objects),
+    counts = list(
+      scanned = length(object_names),
+      signatures = length(signatures)
+    ),
+    signatures = signatures
   )
 }
 
@@ -648,8 +993,7 @@ search_package <- function(package, query, kind = "all", limit = 25) {
   limit <- min(limit, 100)
 
   objects <- all_object_names(package)
-  alias_map <- package_alias_map(package)
-  topics <- unique(c(names(alias_map), unname(alias_map)))
+  topics <- all_help_topics(package)
 
   object_results <- list(matches = list(), total = 0, matched_by = "none")
   topic_results <- list(matches = list(), total = 0, matched_by = "none")
@@ -859,9 +1203,14 @@ dispatch <- function(req) {
     "resolve" = resolve_query(query, package = package, kind = kind, limit = limit),
     "summary" = summary_for_object(package, name),
     "sig" = object_info(package, name),
+    "sigs" = package_signatures(package, all_objects = req[["all_objects"]] %||% FALSE),
     "source" = best_effort_source(package, name),
     "doc" = extract_help_topic(package, topic %||% name),
+    "topics" = list(package = package, topics = canonical_help_topics(package)),
     "methods" = list_methods(package, name),
+    "vignettes" = list_vignettes(package),
+    "vignette" = read_vignette(package, name),
+    "search_vignettes" = search_vignette_text(package, query, limit = limit),
     "files" = list_files(package),
     "grep" = grep_package_files(package, query, glob = glob, limit = limit),
     stop(sprintf("unknown action '%s'", req[["action"]]))

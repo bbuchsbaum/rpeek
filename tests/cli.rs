@@ -30,9 +30,14 @@ fn run(args: &[&str]) -> (i32, String) {
 }
 
 fn run_with_socket(socket: &Path, args: &[&str]) -> (i32, String) {
+    let index_path = socket
+        .parent()
+        .expect("socket should have parent")
+        .join("rpeek-index.sqlite3");
     let output = Command::new(env!("CARGO_BIN_EXE_rpeek"))
         .args(args)
         .env("RPEEK_SOCKET", socket)
+        .env("RPEEK_INDEX_PATH", &index_path)
         .output()
         .expect("failed to run rpeek");
 
@@ -52,6 +57,92 @@ fn pkg_returns_metadata() {
 }
 
 #[test]
+fn map_returns_package_orientation_payload() {
+    let (code, stdout) = run(&["map", "stats"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(value["command"], "map");
+    assert_eq!(value["payload"]["package"], "stats");
+    assert!(value["payload"]["counts"]["exports"].as_u64().unwrap_or(0) > 0);
+    assert!(value["payload"]["dependencies"]["imports"].is_array());
+    assert!(value["payload"]["entry_points"].is_array());
+    assert!(value["payload"]["topic_samples"].is_array());
+    assert!(value["payload"]["vignettes"].is_array());
+    assert!(value["payload"]["file_samples"].is_array());
+}
+
+#[test]
+fn methods_across_finds_generic_methods_for_indexed_packages() {
+    let (code, stdout) = run(&[
+        "methods-across",
+        "plot",
+        "--package",
+        "stats",
+        "--package",
+        "graphics",
+    ]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(value["command"], "methods_across");
+    assert_eq!(value["payload"]["generic"], "plot");
+    let methods = value["payload"]["methods"]
+        .as_array()
+        .expect("missing methods");
+    assert!(!methods.is_empty());
+    assert!(methods.iter().any(|entry| entry["package"] == "stats"));
+}
+
+#[test]
+fn bridge_reports_direct_dependency_edges() {
+    let (code, stdout) = run(&["bridge", "stats", "graphics"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(value["command"], "bridge");
+    assert_eq!(value["payload"]["package"], "stats");
+    assert_eq!(value["payload"]["other_package"], "graphics");
+    let relations = value["payload"]["direct_relations"]["package_to_other"]
+        .as_array()
+        .expect("missing direct relations");
+    assert!(relations.iter().any(|entry| entry == "imports"));
+    assert_eq!(
+        value["payload"]["direct_usage"]["package_to_other"]["namespace_import_all"],
+        true
+    );
+    assert!(
+        value["payload"]["direct_usage"]["package_to_other"]["file_mentions"]
+            .as_array()
+            .is_some()
+    );
+}
+
+#[test]
+fn xref_returns_symbol_payload() {
+    let (code, stdout) = run(&["xref", "stats", "lm"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(value["command"], "xref");
+    assert_eq!(value["payload"]["package"], "stats");
+    assert_eq!(value["payload"]["symbol"], "lm");
+    assert!(value["payload"]["local_mentions"]["files"].is_array());
+}
+
+#[test]
+fn used_by_returns_symbol_payload() {
+    let (code, stdout) = run(&["used-by", "graphics", "plot"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(value["command"], "used_by");
+    assert_eq!(value["payload"]["package"], "graphics");
+    assert_eq!(value["payload"]["symbol"], "plot");
+    assert!(value["payload"]["callers"].is_array());
+}
+
+#[test]
 fn sig_returns_formals() {
     let (code, stdout) = run(&["sig", "stats", "lm"]);
     assert_eq!(code, 0, "stdout: {stdout}");
@@ -61,6 +152,93 @@ fn sig_returns_formals() {
         .as_str()
         .expect("missing signature");
     assert!(signature.contains("function (formula, data, subset"));
+}
+
+#[test]
+fn sigs_returns_exported_function_signatures() {
+    let (code, stdout) = run(&["sigs", "stats"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(value["command"], "sigs");
+    assert_eq!(value["payload"]["package"], "stats");
+    assert_eq!(value["payload"]["all_objects"], false);
+    let signatures = value["payload"]["signatures"]
+        .as_array()
+        .expect("missing signatures");
+    assert!(!signatures.is_empty());
+    assert!(
+        signatures
+            .iter()
+            .all(|entry| entry["signature"].as_str().is_some())
+    );
+    assert!(
+        signatures
+            .iter()
+            .any(|entry| entry["name"] == "lm" && entry["exported"] == true)
+    );
+}
+
+#[test]
+fn sigs_all_objects_includes_internal_functions() {
+    let (code, stdout) = run(&["sigs", "--all-objects", "stats"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(value["payload"]["all_objects"], true);
+    let signatures = value["payload"]["signatures"]
+        .as_array()
+        .expect("missing signatures");
+    assert!(
+        signatures
+            .iter()
+            .any(|entry| entry["name"] == ".onLoad" && entry["exported"] == false)
+    );
+}
+
+#[test]
+fn vignettes_returns_installed_vignette_metadata() {
+    let (code, stdout) = run(&["vignettes", "stats"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(value["command"], "vignettes");
+    let vignettes = value["payload"]["vignettes"]
+        .as_array()
+        .expect("missing vignettes");
+    assert!(!vignettes.is_empty());
+    assert!(
+        vignettes
+            .iter()
+            .any(|entry| entry["topic"] == "reshape" && entry["title"].as_str().is_some())
+    );
+}
+
+#[test]
+fn vignette_returns_text_for_known_vignette() {
+    let (code, stdout) = run(&["vignette", "stats", "reshape"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(value["command"], "vignette");
+    assert_eq!(value["payload"]["topic"], "reshape");
+    let text = value["payload"]["text"].as_str().expect("missing text");
+    assert!(text.contains("reshape"));
+    assert!(value["payload"]["text_kind"].as_str().is_some());
+}
+
+#[test]
+fn search_vignettes_finds_matching_metadata() {
+    let (code, stdout) = run(&["search-vignettes", "utils", "Sweave"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(value["command"], "search_vignettes");
+    let matches = value["payload"]["matches"]
+        .as_array()
+        .expect("missing matches");
+    assert!(!matches.is_empty());
+    assert!(matches.iter().any(|entry| entry["topic"] == "Sweave"));
 }
 
 #[test]
@@ -127,6 +305,167 @@ fn schema_command_returns_contract() {
     let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
     assert_eq!(value["command"], "schema");
     assert_eq!(value["payload"]["title"], "rpeek request");
+}
+
+#[test]
+fn index_status_reports_schema_and_path() {
+    let (code, stdout) = run(&["index", "status"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(value["command"], "index_status");
+    assert_eq!(value["payload"]["schema_version"], 5);
+    assert!(value["payload"]["path"].as_str().is_some());
+}
+
+#[test]
+fn snippet_commands_round_trip() {
+    let tempdir = TempDir::new().expect("failed to create tempdir");
+    let socket = tempdir.path().join("rpeek-snippet.sock");
+    let _guard = DaemonGuard {
+        socket: socket.clone(),
+    };
+
+    let (code, stdout) = run_with_socket(
+        &socket,
+        &[
+            "snippet",
+            "add",
+            "--title",
+            "Read BIDS preproc scan",
+            "--package",
+            "bidser",
+            "--package",
+            "neuroim2",
+            "--tag",
+            "workflow",
+            "--verb",
+            "read",
+            "--status",
+            "verified",
+            "--body",
+            "Use bidser to locate scans, then read them with neuroim2.",
+        ],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let added: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(added["command"], "snippet_add");
+    let id = added["payload"]["id"].as_i64().expect("missing snippet id");
+
+    let (code, stdout) = run_with_socket(&socket, &["snippet", "show", &id.to_string()]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let shown: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(shown["payload"]["title"], "Read BIDS preproc scan");
+    assert_eq!(shown["payload"]["status"], "verified");
+
+    let (code, stdout) = run_with_socket(
+        &socket,
+        &[
+            "snippet",
+            "search",
+            "bids workflow",
+            "--package",
+            "bidser",
+            "--tag",
+            "workflow",
+        ],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let searched: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    let matches = searched["payload"]["matches"]
+        .as_array()
+        .expect("missing matches");
+    assert!(!matches.is_empty());
+    assert_eq!(matches[0]["id"].as_i64(), Some(id));
+
+    let (code, stdout) = run_with_socket(
+        &socket,
+        &[
+            "snippet",
+            "list",
+            "--package",
+            "bidser",
+            "--tag",
+            "workflow",
+        ],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let listed: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    let snippets = listed["payload"]["snippets"]
+        .as_array()
+        .expect("missing snippets");
+    assert!(
+        snippets
+            .iter()
+            .any(|entry| entry["id"].as_i64() == Some(id))
+    );
+
+    let (code, stdout) = run_with_socket(&socket, &["snippet", "delete", &id.to_string()]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let deleted: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(deleted["payload"]["deleted"], true);
+}
+
+#[test]
+fn index_clear_resets_persistent_package_state() {
+    let tempdir = TempDir::new().expect("failed to create tempdir");
+    let socket = tempdir.path().join("rpeek-index.sock");
+    let _guard = DaemonGuard {
+        socket: socket.clone(),
+    };
+
+    let (code, stdout) = run_with_socket(&socket, &["sig", "stats", "lm"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let (code, stdout) = run_with_socket(&socket, &["index", "status"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let status: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(status["payload"]["packages"], 1);
+
+    let (code, stdout) = run_with_socket(&socket, &["index", "clear"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let cleared: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(cleared["command"], "index_clear");
+    assert_eq!(cleared["payload"]["cleared_packages"], 1);
+
+    let (code, stdout) = run_with_socket(&socket, &["index", "status"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let status: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(status["payload"]["packages"], 0);
+}
+
+#[test]
+fn index_package_builds_queryable_package_bundle() {
+    let tempdir = TempDir::new().expect("failed to create tempdir");
+    let socket = tempdir.path().join("rpeek-index-package.sock");
+    let _guard = DaemonGuard {
+        socket: socket.clone(),
+    };
+
+    let (code, stdout) = run_with_socket(&socket, &["index", "package", "stats"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let indexed: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(indexed["command"], "index_package");
+    assert_eq!(indexed["payload"]["package"], "stats");
+    assert!(indexed["payload"]["topics_count"].as_u64().unwrap_or(0) > 0);
+    assert!(indexed["payload"]["vignettes_count"].as_u64().unwrap_or(0) > 0);
+    assert!(indexed["payload"]["files_count"].as_u64().unwrap_or(0) > 0);
+
+    let (code, stdout) = run_with_socket(&socket, &["index", "show", "stats"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let shown: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(shown["command"], "index_show");
+    assert_eq!(shown["payload"]["package"], "stats");
+    assert!(shown["payload"]["exports_count"].as_u64().unwrap_or(0) > 0);
+
+    let (code, stdout) = run_with_socket(&socket, &["index", "search", "stats", "reshape"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let searched: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(searched["command"], "index_search");
+    let matches = searched["payload"]["matches"]
+        .as_array()
+        .expect("missing matches");
+    assert!(!matches.is_empty());
 }
 
 #[test]
@@ -245,6 +584,31 @@ fn search_kind_and_limit_work() {
 }
 
 #[test]
+fn pkg_request_lazily_builds_indexed_package_bundle() {
+    let tempdir = TempDir::new().expect("failed to create tempdir");
+    let socket = tempdir.path().join("rpeek-lazy-index.sock");
+    let _guard = DaemonGuard {
+        socket: socket.clone(),
+    };
+
+    let (code, stdout) = run_with_socket(&socket, &["index", "status"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let before: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(before["payload"]["indexed_packages"], 0);
+
+    let (code, stdout) = run_with_socket(&socket, &["pkg", "stats"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let pkg: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(pkg["payload"]["package"], "stats");
+
+    let (code, stdout) = run_with_socket(&socket, &["index", "show", "stats"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let shown: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(shown["payload"]["package"], "stats");
+    assert!(shown["payload"]["topics_count"].as_u64().unwrap_or(0) > 0);
+}
+
+#[test]
 fn search_all_handles_quoted_query() {
     let (code, stdout) = run(&["search-all", "--limit", "5", "\"lm\""]);
     assert_eq!(code, 0, "stdout: {stdout}");
@@ -332,6 +696,10 @@ fn batch_returns_nonzero_when_any_item_fails() {
     let output = Command::new(env!("CARGO_BIN_EXE_rpeek"))
         .args(["batch", "--file", batch_file.to_str().expect("utf8 path")])
         .env("RPEEK_SOCKET", &socket)
+        .env(
+            "RPEEK_INDEX_PATH",
+            tempdir.path().join("rpeek-index.sqlite3"),
+        )
         .output()
         .expect("failed to run rpeek batch");
 
@@ -370,6 +738,10 @@ fn batch_returns_multiple_responses() {
     let output = Command::new(env!("CARGO_BIN_EXE_rpeek"))
         .args(["batch", "--file", batch_file.to_str().expect("utf8 path")])
         .env("RPEEK_SOCKET", &socket)
+        .env(
+            "RPEEK_INDEX_PATH",
+            tempdir.path().join("rpeek-index.sqlite3"),
+        )
         .output()
         .expect("failed to run rpeek batch");
 
