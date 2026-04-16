@@ -1,8 +1,33 @@
-//! Response shaping utilities for CLI output.
+//! Response shaping utilities shared by the CLI and library consumers.
 //!
-//! These helpers are intentionally protocol-agnostic: they trim large string fields,
-//! optionally remove examples from doc payloads, and determine process exit codes from
-//! successful or partially failed JSON responses.
+//! This module is intentionally protocol-agnostic. It operates on parsed JSON values,
+//! letting callers enforce the same output policy as the CLI: trim oversized string
+//! fields, remove examples, and derive a process-style success code from a response.
+//!
+//! ```
+//! use rpeek::{ResponseOptions, apply_response_options, response_exit_code};
+//! use serde_json::json;
+//!
+//! let mut value = json!({
+//!     "ok": true,
+//!     "payload": {
+//!         "examples": "example code",
+//!         "text": "abcdefghijklmnopqrstuvwxyz"
+//!     }
+//! });
+//!
+//! apply_response_options(
+//!     &mut value,
+//!     &ResponseOptions {
+//!         max_bytes: Some(6),
+//!         no_examples: true,
+//!     },
+//! );
+//!
+//! assert_eq!(response_exit_code(&value), 0);
+//! assert!(value["payload"].get("examples").is_none());
+//! assert!(value["payload"]["text"].as_str().unwrap().contains("[truncated"));
+//! ```
 //!
 use serde_json::Value;
 

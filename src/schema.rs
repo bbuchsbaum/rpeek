@@ -1,7 +1,18 @@
-//! JSON schema support for the request and response contract.
+//! Embedded JSON schemas for the `rpeek` request and response contract.
 //!
-//! The checked-in schema files are embedded at compile time so the CLI can print them
-//! directly via `rpeek schema request` and `rpeek schema response`.
+//! The schema files in `schemas/` are compiled into the binary so callers can inspect
+//! the wire contract without locating files on disk. This is the same data returned by
+//! the CLI's `schema` command.
+//!
+//! ```
+//! use rpeek::{SchemaKind, schema_response};
+//!
+//! let request_schema = schema_response(SchemaKind::Request);
+//!
+//! assert_eq!(request_schema["ok"].as_bool(), Some(true));
+//! assert_eq!(request_schema["command"].as_str(), Some("schema"));
+//! assert!(request_schema["payload"].is_object());
+//! ```
 //!
 use clap::ValueEnum;
 use serde_json::{Value, json};

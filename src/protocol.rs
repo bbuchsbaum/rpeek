@@ -1,8 +1,21 @@
-//! Request types for the Rust client/daemon and R helper protocol.
+//! Typed request values for the `rpeek` wire protocol.
 //!
-//! `rpeek` speaks JSON Lines to a long-lived R helper process. This module keeps the
-//! contract typed on the Rust side so command dispatch, batch execution, and cache keys
-//! all share one representation.
+//! [`Request`] is the Rust representation of the JSON messages sent between the CLI,
+//! daemon, and embedded R helper. Use it when you want a stable, serializable command
+//! model without building command-line strings by hand.
+//!
+//! ```
+//! use rpeek::Request;
+//!
+//! let request = Request::Summary {
+//!     package: "stats".to_string(),
+//!     name: "lm".to_string(),
+//! };
+//!
+//! assert_eq!(request.action(), "summary");
+//! assert_eq!(request.package(), Some("stats"));
+//! assert!(serde_json::to_string(&request).unwrap().contains("\"action\":\"summary\""));
+//! ```
 //!
 use serde::{Deserialize, Serialize};
 
