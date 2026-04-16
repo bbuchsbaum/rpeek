@@ -27,6 +27,8 @@ jobs:
       - name: Disable Jekyll processing
         run: touch target/doc/.nojekyll
       - uses: actions/configure-pages@v5
+        with:
+          enablement: true
       - uses: actions/upload-pages-artifact@v3
         with:
           path: target/doc
