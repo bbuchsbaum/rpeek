@@ -42,6 +42,56 @@ Use `rpeek` to inspect installed R packages quickly.
 - Use `--max-bytes` and `--no-examples` to keep payloads compact when needed.
 ```
 
+## Agent Skills
+
+This repo ships a portable [Anthropic-format skill](skills/rpeek/SKILL.md) that
+teaches a coding agent when and how to use `rpeek`. The same `SKILL.md` works
+with both Claude Code and Codex - they only differ in where the skill file
+lives on disk.
+
+### Install for Claude Code
+
+User-level (available in every project):
+
+```bash
+mkdir -p "$HOME/.claude/skills/rpeek"
+curl -fsSL https://raw.githubusercontent.com/bbuchsbaum/rpeek/main/skills/rpeek/SKILL.md \
+  -o "$HOME/.claude/skills/rpeek/SKILL.md"
+```
+
+Project-level (checked in with one repo):
+
+```bash
+mkdir -p .claude/skills/rpeek
+curl -fsSL https://raw.githubusercontent.com/bbuchsbaum/rpeek/main/skills/rpeek/SKILL.md \
+  -o .claude/skills/rpeek/SKILL.md
+```
+
+### Install for Codex
+
+```bash
+mkdir -p "$HOME/.codex/skills/rpeek"
+curl -fsSL https://raw.githubusercontent.com/bbuchsbaum/rpeek/main/skills/rpeek/SKILL.md \
+  -o "$HOME/.codex/skills/rpeek/SKILL.md"
+```
+
+### Install from a local clone
+
+If you already have this repo checked out, copy the skill directory into the
+appropriate location:
+
+```bash
+# Claude Code (user-level)
+mkdir -p "$HOME/.claude/skills"
+cp -R skills/rpeek "$HOME/.claude/skills/rpeek"
+
+# Codex
+mkdir -p "$HOME/.codex/skills"
+cp -R skills/rpeek "$HOME/.codex/skills/rpeek"
+```
+
+After install, restart your agent session so the skill is picked up.
+
 ## Platform Support
 
 `rpeek` currently targets Unix-like systems: macOS and Linux. It uses Unix domain sockets for the local daemon, so Windows is not supported yet unless run inside a Unix-like environment such as WSL.
