@@ -19,6 +19,10 @@
 //!
 use serde::{Deserialize, Serialize};
 
+fn default_grep_scope() -> String {
+    "all".to_string()
+}
+
 /// A single protocol request sent to the helper or daemon.
 #[derive(Clone, Debug, Serialize, Deserialize, Hash, Eq, PartialEq)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -155,7 +159,7 @@ pub enum Request {
         /// Installed R package name.
         package: String,
     },
-    /// Search installed package files for a literal query.
+    /// Search installed package files and/or deparsed namespace objects for a literal query.
     Grep {
         /// Installed R package name.
         package: String,
@@ -164,6 +168,9 @@ pub enum Request {
         /// Optional glob restriction for relative package paths.
         #[serde(skip_serializing_if = "Option::is_none")]
         glob: Option<String>,
+        /// Search scope: `all`, `files`, or `objects`.
+        #[serde(default = "default_grep_scope")]
+        scope: String,
         /// Maximum matches to return.
         limit: usize,
     },

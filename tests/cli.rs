@@ -754,6 +754,34 @@ fn grep_searches_package_files() {
 }
 
 #[test]
+fn grep_searches_deparsed_namespace_objects() {
+    let (code, stdout) = run(&[
+        "grep", "--scope", "objects", "--limit", "5", "stats", "lm.fit",
+    ]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(value["command"], "grep");
+    assert_eq!(value["payload"]["scope"], "objects");
+    assert_eq!(value["payload"]["scanned_files"], 0);
+    assert!(
+        value["payload"]["scanned_objects"]
+            .as_i64()
+            .unwrap_or_default()
+            > 0
+    );
+
+    let matches = value["payload"]["matches"]
+        .as_array()
+        .expect("missing matches");
+    assert!(
+        matches
+            .iter()
+            .any(|entry| entry["kind"] == "object" && entry["object"].as_str().is_some())
+    );
+}
+
+#[test]
 fn max_bytes_trims_large_strings() {
     let (code, stdout) = run(&["--max-bytes", "80", "doc", "stats", "lm"]);
     assert_eq!(code, 0, "stdout: {stdout}");

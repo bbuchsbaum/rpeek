@@ -168,12 +168,14 @@ enum Commands {
     },
     #[command(about = "Installed package files")]
     Files { package: String },
-    #[command(about = "Search installed package files")]
+    #[command(about = "Search installed package files and deparsed namespace objects")]
     Grep {
         package: String,
         query: String,
         #[arg(long)]
         glob: Option<String>,
+        #[arg(long, value_enum, default_value_t = GrepScope::All)]
+        scope: GrepScope,
         #[arg(long, default_value_t = 25)]
         limit: usize,
     },
@@ -358,6 +360,13 @@ enum SearchKind {
     Topic,
 }
 
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum GrepScope {
+    All,
+    Files,
+    Objects,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct StalePackageInfo {
     package: String,
@@ -422,6 +431,16 @@ impl SearchKind {
             Self::All => "all",
             Self::Object => "object",
             Self::Topic => "topic",
+        }
+    }
+}
+
+impl GrepScope {
+    fn as_request_value(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Files => "files",
+            Self::Objects => "objects",
         }
     }
 }
@@ -591,11 +610,13 @@ fn request_from_command(command: Commands) -> Result<Request> {
             package,
             query,
             glob,
+            scope,
             limit,
         } => Request::Grep {
             package,
             query,
             glob,
+            scope: scope.as_request_value().to_string(),
             limit,
         },
         Commands::Cache { command } => match command {
@@ -1422,7 +1443,7 @@ fn agent_response() -> Value {
                     "command": "rpeek doc <package> <topic>"
                 },
                 {
-                    "task": "Search installed package files",
+                    "task": "Search installed package files and deparsed namespace objects",
                     "command": "rpeek grep <package> <query>"
                 },
                 {

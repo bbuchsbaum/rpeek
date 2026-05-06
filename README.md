@@ -35,7 +35,7 @@ Use `rpeek` to inspect installed R packages quickly.
 - For cross-package work, use `rpeek methods-across <generic> --package <pkg>...` and `rpeek bridge <package> <other-package>`.
 - For symbol-level tracing, use `rpeek xref <package> <symbol>` and `rpeek used-by <package> <symbol>`.
 - Use `rpeek vignettes <package>`, `rpeek vignette <package> <name>`, and `rpeek search-vignettes <package> <query>` for installed vignette discovery.
-- Use `rpeek grep <package> <query>` to search installed package files when docs or deparsed source are not enough.
+- Use `rpeek grep <package> <query>` to search installed package files and deparsed namespace objects when docs or source are not enough.
 - If you will query the same package repeatedly, pre-index it with `rpeek index package <package>`, then use `rpeek index show <package>` and `rpeek index search <package> <query>`.
 - Store local workflow knowledge with `rpeek snippet add`, then retrieve it later with `rpeek snippet search` or `rpeek snippet list`.
 - Output is JSON by default. Parse fields from the JSON instead of scraping prose.
@@ -119,10 +119,22 @@ You need three things:
 | Prerequisite | How to get it |
 |---|---|
 | **R** | [cran.r-project.org](https://cran.r-project.org/) or `brew install r` on macOS |
-| **Rust / cargo** | [rustup.rs](https://rustup.rs/) or your system package manager |
+| **Rust / Cargo** | Use [rustup](https://rustup.rs/) |
 | **jsonlite** (R package) | `Rscript -e 'install.packages("jsonlite")'` |
 
-After installing Rust, make sure Cargo's binary directory is on your `PATH`. For a default rustup install this is usually `~/.cargo/bin`.
+Install Rust and Cargo with rustup:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+After installation, either restart your shell or load Cargo's environment file:
+
+```bash
+. "$HOME/.cargo/env"
+```
+
+For a default rustup install, Cargo's binary directory is `~/.cargo/bin`.
 
 ### 2. Choose a user-local bin directory
 
@@ -213,7 +225,8 @@ RPEEK_R_COMMAND=/full/path/to/R rpeek doctor
 - cross-package method lookup across indexed packages
 - package-to-package dependency and overlap summaries
 - best-effort symbol xref and caller lookup from indexed files
-- installed file listing
+- installed file listing and grep across package text files
+- grep across deparsed namespace objects, including code stored in R lazyload databases
 - daemon-local caching with stats and reset commands
 - persistent index storage for package metadata, docs, vignettes, examples, and file text
 - indexed workflow snippets with status and package-version metadata
@@ -372,11 +385,15 @@ Keep large responses compact:
 cargo run -- --max-bytes 4000 --no-examples doc stats lm
 ```
 
-Search installed package files:
+Search installed package files and deparsed namespace objects:
 
 ```bash
 cargo run -- grep stats lm.fit
+cargo run -- grep --scope objects stats lm.fit
+cargo run -- grep --scope files --glob 'help/*' stats lm.fit
 ```
+
+`grep` defaults to `--scope all`. Use `--scope files` for installed text files only, or `--scope objects` for deparsed namespace functions and other language objects only. Object-scope search is useful for installed packages whose R code lives in lazyload databases instead of plain source files.
 
 Run multiple requests in one process:
 
@@ -549,11 +566,19 @@ If `jsonlite` is missing, install it in the R library used by the same R executa
 Rscript -e 'install.packages("jsonlite")'
 ```
 
-If `rpeek` is not found after `cargo install`, add Cargo's binary directory to your shell path. With rustup, this is usually:
+If `cargo` is not found after installing Rust with rustup, restart your shell or source Cargo's environment file:
 
 ```bash
-export PATH="$HOME/.cargo/bin:$PATH"
+. "$HOME/.cargo/env"
 ```
+
+If `rpeek` is not found after `cargo install --root "$HOME/.local"`, add the install root's `bin` directory to your shell path:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+For `cargo install --root "$HOME"`, use `export PATH="$HOME/bin:$PATH"` instead.
 
 ## Development
 

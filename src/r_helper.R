@@ -1093,44 +1093,126 @@ path_matches_glob <- function(path, glob) {
   grepl(utils::glob2rx(glob), path)
 }
 
-grep_package_files <- function(package, query, glob = NULL, limit = 25) {
+is_probably_text_file <- function(path) {
+  lower <- tolower(path)
+  binary_ext <- c(
+    ".rdb", ".rdx", ".rds", ".rda", ".so", ".dll", ".dylib", ".pdf",
+    ".png", ".jpg", ".jpeg", ".gif", ".gz", ".zip", ".tar", ".xz", ".bz2"
+  )
+  if (any(endsWith(lower, binary_ext))) {
+    return(FALSE)
+  }
+  sample <- tryCatch(
+    readBin(path, what = "raw", n = 1024L),
+    error = function(...) raw()
+  )
+  !any(sample == as.raw(0))
+}
+
+grep_fixed_ignore_case <- function(query, text) {
+  normalize <- function(value) {
+    tolower(iconv(value, from = "", to = "UTF-8", sub = ""))
+  }
+  grep(normalize(query), normalize(text), fixed = TRUE)
+}
+
+empty_grep_result <- function(package, install_path, query, glob, scope, scanned_files,
+                              scanned_objects, matches, truncated) {
+  list(
+    package = package,
+    install_path = install_path,
+    query = query,
+    glob = glob,
+    scope = scope,
+    scanned_files = scanned_files,
+    scanned_objects = scanned_objects,
+    matches = matches,
+    truncated = truncated
+  )
+}
+
+grep_package_files <- function(package, query, glob = NULL, limit = 25, scope = "all") {
   pkg_path <- normalize_package(package)
   limit <- suppressWarnings(as.integer(limit))
   if (is.na(limit) || limit < 1) {
     limit <- 25
   }
   limit <- min(limit, 200)
+  scope <- match.arg(scope %||% "all", c("all", "files", "objects"))
 
-  files <- list.files(pkg_path, recursive = TRUE, all.files = TRUE, no.. = TRUE)
-  files <- files[path_matches_glob(files, glob)]
   matches <- list()
   scanned <- 0L
+  scanned_objects <- 0L
 
-  for (rel in files) {
-    full <- file.path(pkg_path, rel)
-    if (!file.info(full)$isdir && file.info(full)$size <= 1024 * 1024) {
-      text <- tryCatch(readLines(full, warn = FALSE, encoding = "UTF-8"), error = function(...) NULL)
+  if (scope %in% c("all", "files")) {
+    files <- list.files(pkg_path, recursive = TRUE, all.files = TRUE, no.. = TRUE)
+    files <- files[path_matches_glob(files, glob)]
+
+    for (rel in files) {
+      full <- file.path(pkg_path, rel)
+      if (!file.info(full)$isdir &&
+          file.info(full)$size <= 1024 * 1024 &&
+          is_probably_text_file(full)) {
+        text <- tryCatch(
+          readLines(full, warn = FALSE, encoding = "UTF-8"),
+          error = function(...) NULL
+        )
+        if (is.null(text)) {
+          next
+        }
+        text <- iconv(text, from = "", to = "UTF-8", sub = "")
+        scanned <- scanned + 1L
+        idx <- grep_fixed_ignore_case(query, text)
+        if (length(idx)) {
+          for (line_no in idx) {
+            matches[[length(matches) + 1L]] <- list(
+              kind = "file",
+              path = rel,
+              line = as.integer(line_no),
+              text = text[[line_no]]
+            )
+            if (length(matches) >= limit) {
+              return(empty_grep_result(
+                package, pkg_path, query, glob, scope, scanned, scanned_objects, matches, TRUE
+              ))
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (scope %in% c("all", "objects")) {
+    ns <- asNamespace(package)
+    for (object_name in all_object_names(package)) {
+      obj <- tryCatch(
+        suppressWarnings(get(object_name, envir = ns, inherits = FALSE)),
+        error = function(...) NULL
+      )
+      if (!(is.function(obj) || is.language(obj) || is.expression(obj))) {
+        next
+      }
+      text <- tryCatch(
+        suppressWarnings(deparse(obj, nlines = -1L)),
+        error = function(...) NULL
+      )
       if (is.null(text)) {
         next
       }
-      scanned <- scanned + 1L
-      idx <- grep(query, text, fixed = TRUE, ignore.case = TRUE)
+      scanned_objects <- scanned_objects + 1L
+      idx <- grep_fixed_ignore_case(query, text)
       if (length(idx)) {
         for (line_no in idx) {
           matches[[length(matches) + 1L]] <- list(
-            path = rel,
+            kind = "object",
+            object = object_name,
+            source_kind = "deparsed",
             line = as.integer(line_no),
             text = text[[line_no]]
           )
           if (length(matches) >= limit) {
-            return(list(
-              package = package,
-              install_path = pkg_path,
-              query = query,
-              glob = glob,
-              scanned_files = scanned,
-              matches = matches,
-              truncated = TRUE
+            return(empty_grep_result(
+              package, pkg_path, query, glob, scope, scanned, scanned_objects, matches, TRUE
             ))
           }
         }
@@ -1138,14 +1220,8 @@ grep_package_files <- function(package, query, glob = NULL, limit = 25) {
     }
   }
 
-  list(
-    package = package,
-    install_path = pkg_path,
-    query = query,
-    glob = glob,
-    scanned_files = scanned,
-    matches = matches,
-    truncated = FALSE
+  empty_grep_result(
+    package, pkg_path, query, glob, scope, scanned, scanned_objects, matches, FALSE
   )
 }
 
@@ -1186,6 +1262,7 @@ dispatch <- function(req) {
   limit <- req[["limit"]] %||% "25"
   topic <- req[["topic"]]
   glob <- req[["glob"]]
+  scope <- req[["scope"]] %||% "all"
 
   payload <- switch(
     req[["action"]],
@@ -1212,7 +1289,9 @@ dispatch <- function(req) {
     "vignette" = read_vignette(package, name),
     "search_vignettes" = search_vignette_text(package, query, limit = limit),
     "files" = list_files(package),
-    "grep" = grep_package_files(package, query, glob = glob, limit = limit),
+    "grep" = grep_package_files(
+      package, query, glob = glob, limit = limit, scope = scope
+    ),
     stop(sprintf("unknown action '%s'", req[["action"]]))
   )
 

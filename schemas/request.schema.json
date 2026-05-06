@@ -47,6 +47,10 @@
       "minimum": 1
     },
     "glob": { "type": "string" },
+    "scope": {
+      "type": "string",
+      "enum": ["all", "files", "objects"]
+    },
     "all_objects": { "type": "boolean" }
   },
   "additionalProperties": false
