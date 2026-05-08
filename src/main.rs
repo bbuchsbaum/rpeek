@@ -45,7 +45,10 @@ Examples:
   rpeek vignette dplyr rowwise
   rpeek summary dplyr mutate
   rpeek source dplyr mutate
+  rpeek source dplyr mutate --args-only
+  rpeek source dplyr mutate --grep \"%>%\" --context 2
   rpeek doc dplyr mutate
+  rpeek doc dplyr::mutate
   rpeek batch --file requests.jsonl
   rpeek agent";
 
@@ -148,9 +151,33 @@ enum Commands {
         all_objects: bool,
     },
     #[command(visible_alias = "src", about = "Best-effort source retrieval")]
-    Source { package: String, name: String },
-    #[command(about = "Installed help / roxygen-derived docs")]
-    Doc { package: String, topic: String },
+    Source {
+        package: String,
+        name: String,
+        #[arg(long, help = "Return only the function signature")]
+        args_only: bool,
+        #[arg(long, value_name = "N", help = "Limit returned text to the first N lines")]
+        head: Option<usize>,
+        #[arg(long, value_name = "PATTERN", help = "Keep only lines matching this pattern")]
+        grep: Option<String>,
+        #[arg(
+            long,
+            value_name = "N",
+            default_value_t = 0,
+            help = "Lines of context around each --grep match (only with --grep)"
+        )]
+        context: usize,
+    },
+    #[command(
+        about = "Installed help / roxygen-derived docs",
+        long_about = "Installed help / roxygen-derived docs.\n\n\
+            Accepts either two positional args (`rpeek doc <package> <topic>`) or the\n\
+            `pkg::topic` shorthand (`rpeek doc <package>::<topic>`)."
+    )]
+    Doc {
+        package: String,
+        topic: Option<String>,
+    },
     #[command(hide = true, about = "Installed help topic names")]
     Topics { package: String },
     #[command(about = "Related S3/S4 methods")]
@@ -590,8 +617,30 @@ fn request_from_command(command: Commands) -> Result<Request> {
             package,
             all_objects,
         },
-        Commands::Source { package, name } => Request::Source { package, name },
-        Commands::Doc { package, topic } => Request::Doc { package, topic },
+        Commands::Source {
+            package,
+            name,
+            args_only,
+            head,
+            grep,
+            context,
+        } => {
+            if grep.is_none() && context > 0 {
+                bail!("--context requires --grep");
+            }
+            Request::Source {
+                package,
+                name,
+                args_only,
+                head,
+                grep,
+                context,
+            }
+        }
+        Commands::Doc { package, topic } => {
+            let (package, topic) = resolve_pkg_topic(package, topic)?;
+            Request::Doc { package, topic }
+        }
         Commands::Topics { package } => Request::Topics { package },
         Commands::Methods { package, name } => Request::Methods { package, name },
         Commands::Vignettes { package } => Request::Vignettes { package },
@@ -639,6 +688,30 @@ fn request_from_command(command: Commands) -> Result<Request> {
     };
 
     Ok(request)
+}
+
+fn resolve_pkg_topic(package: String, topic: Option<String>) -> Result<(String, String)> {
+    if let Some(topic) = topic {
+        if package.contains("::") {
+            bail!(
+                "ambiguous arguments: received both `pkg::topic` shorthand ({package}) and a separate topic ({topic}); pass either form, not both"
+            );
+        }
+        return Ok((package, topic));
+    }
+
+    if let Some((pkg, name)) = package.split_once("::") {
+        if pkg.is_empty() || name.is_empty() {
+            bail!(
+                "invalid `pkg::topic` shorthand `{package}`; expected `<package>::<topic>` (e.g. `stats::lm`)"
+            );
+        }
+        return Ok((pkg.to_string(), name.to_string()));
+    }
+
+    bail!(
+        "missing topic; pass `rpeek doc <package> <topic>` or `rpeek doc <package>::<topic>`"
+    );
 }
 
 fn query_daemon(request: &Request, options: &ResponseOptions) -> Result<Value> {
@@ -4014,4 +4087,43 @@ fn path_fingerprint(path: &Path) -> Result<String> {
         .as_secs();
 
     Ok(modified.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_pkg_topic_accepts_separate_args() {
+        let (pkg, topic) =
+            resolve_pkg_topic("stats".to_string(), Some("lm".to_string())).unwrap();
+        assert_eq!(pkg, "stats");
+        assert_eq!(topic, "lm");
+    }
+
+    #[test]
+    fn resolve_pkg_topic_splits_qualified_form() {
+        let (pkg, topic) = resolve_pkg_topic("stats::lm".to_string(), None).unwrap();
+        assert_eq!(pkg, "stats");
+        assert_eq!(topic, "lm");
+    }
+
+    #[test]
+    fn resolve_pkg_topic_rejects_mixed_forms() {
+        let err =
+            resolve_pkg_topic("stats::lm".to_string(), Some("glm".to_string())).unwrap_err();
+        assert!(err.to_string().contains("ambiguous"));
+    }
+
+    #[test]
+    fn resolve_pkg_topic_requires_topic() {
+        let err = resolve_pkg_topic("stats".to_string(), None).unwrap_err();
+        assert!(err.to_string().contains("missing topic"));
+    }
+
+    #[test]
+    fn resolve_pkg_topic_rejects_partial_qualified_form() {
+        let err = resolve_pkg_topic("::lm".to_string(), None).unwrap_err();
+        assert!(err.to_string().contains("invalid"));
+    }
 }

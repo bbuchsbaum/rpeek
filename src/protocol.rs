@@ -113,6 +113,18 @@ pub enum Request {
         package: String,
         /// Object name.
         name: String,
+        /// Return only the function signature instead of full source.
+        #[serde(default)]
+        args_only: bool,
+        /// Limit the returned text to the first N lines.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        head: Option<usize>,
+        /// Filter the returned text to lines matching this pattern.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grep: Option<String>,
+        /// Number of context lines to include around each `grep` match.
+        #[serde(default)]
+        context: usize,
     },
     /// Return installed help text and structured doc fields.
     Doc {

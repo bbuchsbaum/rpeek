@@ -259,8 +259,18 @@ rpeek search-vignettes stats reshape
 rpeek resolve lm
 rpeek summary stats lm
 rpeek source stats lm
+rpeek source stats lm --args-only
+rpeek source stats lm --grep "ret.x" --context 2
+rpeek source stats lm --head 40
 rpeek doc stats lm
+rpeek doc stats::lm
 ```
+
+`rpeek doc` accepts either two positional args or the `pkg::topic` shorthand. When
+the installed help database is corrupt or unavailable, `rpeek doc` falls back to
+the deparsed source and signature; the response is tagged with
+`doc_source: "fallback_source"` and surfaces the underlying R error in
+`help_error`.
 
 If you are working from a local clone, build first:
 
