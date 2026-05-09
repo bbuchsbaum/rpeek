@@ -330,7 +330,67 @@ source_from_srcref <- function(path, range) {
   )
 }
 
-best_effort_source <- function(package, name) {
+apply_grep_filter <- function(text, pattern, context = 0L) {
+  if (is.null(text) || !nzchar(text)) {
+    return(list(text = text, match_count = 0L))
+  }
+  context <- as.integer(context)
+  if (is.na(context) || context < 0L) context <- 0L
+
+  lines <- strsplit(text, "\n", fixed = TRUE)[[1]]
+  hits <- tryCatch(
+    grep(pattern, lines, perl = TRUE),
+    error = function(...) grep(pattern, lines, fixed = TRUE)
+  )
+  if (!length(hits)) {
+    return(list(text = "", match_count = 0L))
+  }
+
+  ranges <- lapply(hits, function(idx) {
+    seq.int(max(1L, idx - context), min(length(lines), idx + context))
+  })
+  keep <- sort(unique(unlist(ranges)))
+  if (context > 0L && length(keep) > 1L) {
+    gaps <- which(diff(keep) > 1L)
+    if (length(gaps)) {
+      pieces <- split(keep, cumsum(c(1L, diff(keep)) > 1L))
+      separator <- "--"
+      out <- character()
+      for (i in seq_along(pieces)) {
+        if (i > 1L) out <- c(out, separator)
+        out <- c(out, lines[pieces[[i]]])
+      }
+      return(list(text = paste(out, collapse = "\n"), match_count = length(hits)))
+    }
+  }
+  list(
+    text = paste(lines[keep], collapse = "\n"),
+    match_count = length(hits)
+  )
+}
+
+apply_head_filter <- function(text, head) {
+  head <- suppressWarnings(as.integer(head))
+  if (is.na(head) || head <= 0L) {
+    return(list(text = text, total_lines = NA_integer_, truncated = FALSE))
+  }
+  lines <- strsplit(text %||% "", "\n", fixed = TRUE)[[1]]
+  total <- length(lines)
+  if (total <= head) {
+    return(list(text = text, total_lines = total, truncated = FALSE))
+  }
+  list(
+    text = paste(lines[seq_len(head)], collapse = "\n"),
+    total_lines = total,
+    truncated = TRUE
+  )
+}
+
+best_effort_source <- function(package, name,
+                               args_only = FALSE,
+                               head = NULL,
+                               grep = NULL,
+                               context = 0L) {
   info <- lookup_object(package, name)
   obj <- info$object
 
@@ -346,7 +406,42 @@ best_effort_source <- function(package, name) {
       origin <- srcref_source$origin
       range <- srcref_source$range
     }
-    return(list(
+
+    filters <- list()
+
+    if (isTRUE(args_only)) {
+      sig <- format_signature(obj)
+      if (!is.null(sig)) {
+        text <- sig
+        kind <- "signature"
+        range <- NULL
+      }
+      filters$args_only <- TRUE
+    }
+
+    grep_match_count <- NA_integer_
+    if (!is.null(grep) && nzchar(grep)) {
+      filtered <- apply_grep_filter(text, grep, context = context)
+      text <- filtered$text
+      grep_match_count <- filtered$match_count
+      filters$grep <- grep
+      filters$grep_match_count <- grep_match_count
+      if (context > 0L) filters$context <- as.integer(context)
+      range <- NULL
+    }
+
+    truncated <- FALSE
+    total_lines <- NA_integer_
+    if (!is.null(head)) {
+      head_result <- apply_head_filter(text, head)
+      text <- head_result$text
+      total_lines <- head_result$total_lines
+      truncated <- head_result$truncated
+      filters$head <- as.integer(head)
+      if (truncated) range <- NULL
+    }
+
+    payload <- list(
       package = package,
       name = name,
       kind = kind,
@@ -354,7 +449,13 @@ best_effort_source <- function(package, name) {
       range = range,
       language = "R",
       text = text
-    ))
+    )
+    if (length(filters)) {
+      payload$filters <- filters
+      payload$truncated <- truncated
+      if (!is.na(total_lines)) payload$total_lines <- as.integer(total_lines)
+    }
+    return(payload)
   }
 
   list(
@@ -368,9 +469,60 @@ best_effort_source <- function(package, name) {
   )
 }
 
+fallback_help_topic <- function(package, topic, help_error) {
+  obj_info <- tryCatch(lookup_object(package, topic), error = function(...) NULL)
+  if (is.null(obj_info)) {
+    return(NULL)
+  }
+
+  signature <- format_signature(obj_info$object)
+  source_payload <- tryCatch(
+    best_effort_source(package, topic),
+    error = function(...) NULL
+  )
+  text <- if (!is.null(source_payload) && !is.null(source_payload$text)) {
+    if (!is.null(signature)) {
+      paste(signature, source_payload$text, sep = "\n\n")
+    } else {
+      source_payload$text
+    }
+  } else {
+    signature
+  }
+
+  list(
+    package = package,
+    topic = topic,
+    aliases = topic,
+    title = NULL,
+    description = NULL,
+    usage = signature,
+    arguments = NULL,
+    arguments_detail = list(),
+    value = NULL,
+    examples = NULL,
+    text = text,
+    doc_source = "fallback_source",
+    help_error = help_error
+  )
+}
+
 extract_help_topic <- function(package, topic) {
-  path <- suppressWarnings(do.call(utils::help, list(topic = topic, package = package)))
+  help_error <- NULL
+  path <- tryCatch(
+    suppressWarnings(do.call(utils::help, list(topic = topic, package = package))),
+    error = function(err) {
+      help_error <<- conditionMessage(err)
+      character()
+    }
+  )
   if (length(path) == 0) {
+    fallback <- fallback_help_topic(
+      package, topic, help_error %||% "help topic not indexed"
+    )
+    if (!is.null(fallback)) {
+      return(fallback)
+    }
     suggestions <- topic_suggestions(package, topic)
     rpkg_stop(
       "topic_not_found",
@@ -380,7 +532,30 @@ extract_help_topic <- function(package, topic) {
     )
   }
 
-  rd <- utils:::.getHelpFile(path)
+  rd <- tryCatch(
+    utils:::.getHelpFile(path),
+    error = function(err) {
+      help_error <<- conditionMessage(err)
+      NULL
+    }
+  )
+  if (is.null(rd)) {
+    fallback <- fallback_help_topic(
+      package, topic, help_error %||% "help database unavailable"
+    )
+    if (!is.null(fallback)) {
+      return(fallback)
+    }
+    rpkg_stop(
+      "help_unavailable",
+      sprintf(
+        "help for '%s' in package '%s' could not be loaded: %s",
+        topic, package, help_error %||% "unknown error"
+      ),
+      hint = sprintf("Try `rpeek source %s %s` for source-only output.", package, topic)
+    )
+  }
+
   plain_text <- strip_rd_overstrike(
     paste(capture.output(tools::Rd2txt(rd, options = list(width = 80))), collapse = "\n")
   )
@@ -421,7 +596,9 @@ extract_help_topic <- function(package, topic) {
     arguments_detail = parse_arguments_text(arguments_text),
     value = plain_sections[["Value"]] %||% section_text("\\value"),
     examples = plain_sections[["Examples"]] %||% section_text("\\examples"),
-    text = plain_text
+    text = plain_text,
+    doc_source = "help",
+    help_error = NULL
   )
 }
 
@@ -824,6 +1001,9 @@ help_topic_summary <- function(package, topic) {
     error = function(...) NULL
   )
   if (is.null(doc)) {
+    return(NULL)
+  }
+  if (identical(doc$doc_source, "fallback_source")) {
     return(NULL)
   }
 
@@ -1281,7 +1461,14 @@ dispatch <- function(req) {
     "summary" = summary_for_object(package, name),
     "sig" = object_info(package, name),
     "sigs" = package_signatures(package, all_objects = req[["all_objects"]] %||% FALSE),
-    "source" = best_effort_source(package, name),
+    "source" = best_effort_source(
+      package,
+      name,
+      args_only = isTRUE(req[["args_only"]]),
+      head = req[["head"]],
+      grep = req[["grep"]],
+      context = req[["context"]] %||% 0L
+    ),
     "doc" = extract_help_topic(package, topic %||% name),
     "topics" = list(package = package, topics = canonical_help_topics(package)),
     "methods" = list_methods(package, name),

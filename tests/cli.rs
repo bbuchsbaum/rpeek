@@ -254,6 +254,64 @@ fn source_returns_kind_and_text() {
 }
 
 #[test]
+fn source_args_only_returns_signature() {
+    let (code, stdout) = run(&["source", "--args-only", "stats", "lm"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(value["payload"]["kind"], "signature");
+    let text = value["payload"]["text"].as_str().expect("missing text");
+    assert!(text.contains("function (formula, data"));
+    assert!(!text.contains("ret.x <- x"));
+    assert_eq!(value["payload"]["filters"]["args_only"], true);
+}
+
+#[test]
+fn source_head_caps_lines_and_reports_total() {
+    let (code, stdout) = run(&["source", "--head", "5", "stats", "lm"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    let text = value["payload"]["text"].as_str().expect("missing text");
+    assert!(text.lines().count() <= 5);
+    assert_eq!(value["payload"]["truncated"], true);
+    assert_eq!(value["payload"]["filters"]["head"], 5);
+    assert!(value["payload"]["total_lines"].as_u64().unwrap_or(0) > 5);
+}
+
+#[test]
+fn source_grep_filters_to_matching_lines() {
+    let (code, stdout) = run(&["source", "--grep", "ret.x", "stats", "lm"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    let text = value["payload"]["text"].as_str().expect("missing text");
+    assert!(text.contains("ret.x <- x"));
+    assert!(!text.contains("function (formula, data"));
+    assert_eq!(value["payload"]["filters"]["grep"], "ret.x");
+    assert!(
+        value["payload"]["filters"]["grep_match_count"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1
+    );
+}
+
+#[test]
+fn source_context_rejected_without_grep() {
+    let (code, stdout) = run(&["source", "--context", "3", "stats", "lm"]);
+    assert_ne!(code, 0, "stdout: {stdout}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(value["ok"], false);
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("--context")
+    );
+}
+
+#[test]
 fn doc_returns_usage() {
     let (code, stdout) = run(&["doc", "stats", "lm"]);
     assert_eq!(code, 0, "stdout: {stdout}");
@@ -268,6 +326,31 @@ fn doc_returns_usage() {
     assert!(usage.contains("lm(formula, data"));
     assert!(usage.contains("print(x, digits"));
     assert!(!usage.contains("printlm("));
+    assert_eq!(value["payload"]["doc_source"], "help");
+}
+
+#[test]
+fn doc_accepts_pkg_topic_shorthand() {
+    let (code, stdout) = run(&["doc", "stats::lm"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(value["payload"]["package"], "stats");
+    assert_eq!(value["payload"]["topic"], "lm");
+}
+
+#[test]
+fn doc_rejects_mixed_pkg_topic_forms() {
+    let (code, stdout) = run(&["doc", "stats::lm", "glm"]);
+    assert_ne!(code, 0, "stdout: {stdout}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(value["ok"], false);
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("ambiguous")
+    );
 }
 
 #[test]
