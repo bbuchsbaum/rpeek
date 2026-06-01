@@ -31,10 +31,7 @@ fn run(args: &[&str]) -> (i32, String) {
 }
 
 fn run_with_socket(socket: &Path, args: &[&str]) -> (i32, String) {
-    let index_path = socket
-        .parent()
-        .expect("socket should have parent")
-        .join("rpeek-index.sqlite3");
+    let index_path = index_path_for_socket(socket);
     let output = Command::new(env!("CARGO_BIN_EXE_rpeek"))
         .args(args)
         .env("RPEEK_SOCKET", socket)
@@ -44,6 +41,13 @@ fn run_with_socket(socket: &Path, args: &[&str]) -> (i32, String) {
 
     let stdout = String::from_utf8(output.stdout).expect("stdout not utf8");
     (output.status.code().unwrap_or(-1), stdout)
+}
+
+fn index_path_for_socket(socket: &Path) -> PathBuf {
+    socket
+        .parent()
+        .expect("socket should have parent")
+        .join("rpeek-index.sqlite3")
 }
 
 #[test]
@@ -71,6 +75,18 @@ fn map_returns_package_orientation_payload() {
     assert!(value["payload"]["topic_samples"].is_array());
     assert!(value["payload"]["vignettes"].is_array());
     assert!(value["payload"]["file_samples"].is_array());
+}
+
+#[test]
+fn agent_guidance_includes_index_refresh_recovery() {
+    let (code, stdout) = run(&["agent"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(value["command"], "agent");
+    let serialized = serde_json::to_string(&value["payload"]).expect("serialize payload");
+    assert!(serialized.contains("rpeek index refresh <package>"));
+    assert!(serialized.contains("do not switch to Rscript"));
 }
 
 #[test]
@@ -539,10 +555,7 @@ fn snippet_show_marks_version_mismatches_as_stale() {
     let _guard = DaemonGuard {
         socket: socket.clone(),
     };
-    let index_path = socket
-        .parent()
-        .expect("socket should have parent")
-        .join("rpeek-index.sqlite3");
+    let index_path = index_path_for_socket(&socket);
 
     let (code, stdout) = run_with_socket(
         &socket,
@@ -787,6 +800,8 @@ fn index_package_builds_queryable_package_bundle() {
     let indexed: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
     assert_eq!(indexed["command"], "index_package");
     assert_eq!(indexed["payload"]["package"], "stats");
+    assert_eq!(indexed["payload"]["freshness"], "refreshed");
+    assert_eq!(indexed["payload"]["refresh_reason"], "explicit");
     assert!(indexed["payload"]["topics_count"].as_u64().unwrap_or(0) > 0);
     assert!(indexed["payload"]["vignettes_count"].as_u64().unwrap_or(0) > 0);
     assert!(indexed["payload"]["files_count"].as_u64().unwrap_or(0) > 0);
@@ -796,17 +811,87 @@ fn index_package_builds_queryable_package_bundle() {
     let shown: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
     assert_eq!(shown["command"], "index_show");
     assert_eq!(shown["payload"]["package"], "stats");
+    assert_eq!(shown["payload"]["freshness"], "fresh");
     assert!(shown["payload"]["exports_count"].as_u64().unwrap_or(0) > 0);
 
     let (code, stdout) = run_with_socket(&socket, &["index", "search", "stats", "reshape"]);
     assert_eq!(code, 0, "stdout: {stdout}");
     let searched: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
     assert_eq!(searched["command"], "index_search");
+    assert_eq!(searched["payload"]["freshness"], "fresh");
     assert_eq!(searched["payload"]["match_query"], "\"reshape\"");
     let matches = searched["payload"]["matches"]
         .as_array()
         .expect("missing matches");
     assert!(!matches.is_empty());
+
+    let (code, stdout) = run_with_socket(&socket, &["index", "refresh", "stats"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let refreshed: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(refreshed["command"], "index_refresh");
+    assert_eq!(refreshed["payload"]["package"], "stats");
+    assert_eq!(refreshed["payload"]["freshness"], "refreshed");
+    assert_eq!(refreshed["payload"]["refresh_reason"], "explicit");
+}
+
+#[test]
+fn index_show_builds_missing_package_bundle() {
+    let tempdir = TempDir::new().expect("failed to create tempdir");
+    let socket = tempdir.path().join("rpeek-index-show-refresh.sock");
+    let _guard = DaemonGuard {
+        socket: socket.clone(),
+    };
+
+    let (code, stdout) = run_with_socket(&socket, &["index", "show", "stats"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let shown: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(shown["command"], "index_show");
+    assert_eq!(shown["payload"]["package"], "stats");
+    assert_eq!(shown["payload"]["freshness"], "refreshed");
+    assert_eq!(shown["payload"]["refresh_reason"], "not_indexed");
+    assert!(shown["payload"]["topics_count"].as_u64().unwrap_or(0) > 0);
+}
+
+#[test]
+fn index_search_refreshes_stale_package_bundle() {
+    let tempdir = TempDir::new().expect("failed to create tempdir");
+    let socket = tempdir.path().join("rpeek-index-search-refresh.sock");
+    let _guard = DaemonGuard {
+        socket: socket.clone(),
+    };
+    let index_path = index_path_for_socket(&socket);
+
+    let (code, stdout) = run_with_socket(&socket, &["index", "package", "stats"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let conn = Connection::open(&index_path).expect("open index db");
+    conn.execute(
+        "UPDATE package_index_state SET local_fingerprint = 'stale-test-fingerprint' WHERE package = 'stats'",
+        [],
+    )
+    .expect("mark package index stale");
+    drop(conn);
+
+    let (code, stdout) = run_with_socket(&socket, &["index", "search", "stats", "reshape"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let searched: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(searched["command"], "index_search");
+    assert_eq!(searched["payload"]["freshness"], "refreshed");
+    assert_eq!(searched["payload"]["refresh_reason"], "fingerprint_changed");
+    let matches = searched["payload"]["matches"]
+        .as_array()
+        .expect("missing matches");
+    assert!(!matches.is_empty());
+
+    let conn = Connection::open(&index_path).expect("open index db");
+    let stored_fingerprint: String = conn
+        .query_row(
+            "SELECT local_fingerprint FROM package_index_state WHERE package = 'stats'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read refreshed fingerprint");
+    assert_ne!(stored_fingerprint, "stale-test-fingerprint");
 }
 
 #[test]
@@ -950,6 +1035,43 @@ fn search_kind_and_limit_work() {
     assert!(!matches.is_empty());
     assert!(matches.len() <= 3);
     assert!(matches.iter().all(|entry| entry["kind"] == "topic"));
+}
+
+#[test]
+fn search_no_fuzzy_returns_empty_when_no_substring_match() {
+    let (code, stdout) = run(&[
+        "search",
+        "--no-fuzzy",
+        "stats",
+        "thissymboldoesnotexistxyzzy",
+    ]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    let matches = value["payload"]["matches"]
+        .as_array()
+        .expect("missing matches");
+    assert!(
+        matches.is_empty(),
+        "expected no matches under --no-fuzzy, got: {matches:?}"
+    );
+}
+
+#[test]
+fn search_without_no_fuzzy_falls_back_to_fuzzy() {
+    let (code, stdout) = run(&["search", "stats", "thissymboldoesnotexistxyzzy"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    let matches = value["payload"]["matches"]
+        .as_array()
+        .expect("missing matches");
+    if !matches.is_empty() {
+        assert!(
+            matches.iter().any(|entry| entry["matched_by"] == "fuzzy"),
+            "expected at least one fuzzy match without --no-fuzzy, got: {matches:?}"
+        );
+    }
 }
 
 #[test]

@@ -60,6 +60,7 @@ in only if needed.
    rpeek search <package> <query>          # within one package
    rpeek search-all <query>                # across all installed packages
    rpeek search --kind object --limit 10 <package> <query>
+   rpeek search --no-fuzzy <package> <query> # substring-only
    ```
 
 3. **Resolve and summarize a known symbol**
@@ -74,7 +75,10 @@ in only if needed.
    ```bash
    rpeek sig <package> <name>              # function signature
    rpeek source <package> <name>           # best-effort source
+   rpeek source --args-only <package> <name>
+   rpeek source --grep <pattern> --context 3 <package> <name>
    rpeek doc <package> <name>              # installed help
+   rpeek doc <package>::<topic>            # shorthand
    rpeek methods <package> <name>          # S3/S4 methods
    ```
 
@@ -106,18 +110,25 @@ in only if needed.
 8. **Last-resort file search**
 
    ```bash
-   rpeek grep <package> <query>            # search installed package files
+   rpeek grep <package> <query>            # files and deparsed objects
+   rpeek grep --scope objects <package> <query>
    ```
 
 ## Speed tips
 
-- For repeated queries on the same package, pre-index it once:
+- For repeated queries on the same package, refresh or inspect the persistent
+  index. `index show` and `index search` refresh missing or stale package
+  bundles before reading them.
 
   ```bash
-  rpeek index package <package>
+  rpeek index refresh <package>
   rpeek index show <package>
   rpeek index search <package> <query>
   ```
+
+  Treat `freshness: "stale_unrefreshable"` as a real warning and inspect the
+  `refresh_error`, but do not switch to ad-hoc `Rscript` merely because an
+  index was stale.
 
 - To keep payloads small, add `--max-bytes <N>` and `--no-examples`:
 
@@ -172,6 +183,9 @@ rpeek snippet list --package <pkg>
 
 - Do not start `Rscript` to ask "what does function X look like" when
   `rpeek sig`, `rpeek summary`, or `rpeek doc` will answer in milliseconds.
+- Do not treat a stale index as a reason to abandon `rpeek`. Use
+  `rpeek index refresh <package>` or retry `rpeek index show/search`; these
+  commands self-heal stale and missing package indexes.
 - Do not `grep` the installed library tree manually before trying
   `rpeek search`, `rpeek search-all`, or `rpeek grep`.
 - Do not pass `--no-daemon` for normal use - it disables the warm cache that

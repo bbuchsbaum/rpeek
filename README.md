@@ -29,14 +29,14 @@ Paste this into an agent prompt when you want it to use `rpeek` effectively:
 Use `rpeek` to inspect installed R packages quickly.
 
 - Start with `rpeek map <package>` for a one-shot package orientation pass. Use `rpeek pkg <package>` and `rpeek exports <package>` when you want the raw metadata and export list separately.
-- If you only know part of a name, use `rpeek search <package> <query>` or `rpeek search-all <query>`.
+- If you only know part of a name, use `rpeek search <package> <query>` or `rpeek search-all <query>`. Pass `--no-fuzzy` to suppress the fuzzy fallback when you only want substring hits.
 - For many functions at once, use `rpeek sigs <package>`. Add `--all-objects` for non-exported namespace functions.
-- For one object, use `rpeek summary <package> <name>` first, then drill into `rpeek sig`, `rpeek source`, `rpeek doc`, and `rpeek methods`.
+- For one object, use `rpeek summary <package> <name>` first, then drill into `rpeek sig`, `rpeek source`, `rpeek doc`, and `rpeek methods`. Add `--grep <pattern> --context <N>` or `--args-only` to keep source payloads focused.
 - For cross-package work, use `rpeek methods-across <generic> --package <pkg>...` and `rpeek bridge <package> <other-package>`.
 - For symbol-level tracing, use `rpeek xref <package> <symbol>` and `rpeek used-by <package> <symbol>`.
 - Use `rpeek vignettes <package>`, `rpeek vignette <package> <name>`, and `rpeek search-vignettes <package> <query>` for installed vignette discovery.
 - Use `rpeek grep <package> <query>` to search installed package files and deparsed namespace objects when docs or source are not enough.
-- If you will query the same package repeatedly, pre-index it with `rpeek index package <package>`, then use `rpeek index show <package>` and `rpeek index search <package> <query>`.
+- If you will query the same package repeatedly, use `rpeek index refresh <package>`, `rpeek index show <package>`, and `rpeek index search <package> <query>`. Stale or missing indexes are refreshed by `rpeek`; do not fall back to `Rscript` just because an index is stale.
 - Store local workflow knowledge with `rpeek snippet add`, then retrieve it later with `rpeek snippet search` or `rpeek snippet list`.
 - Output is JSON by default. Parse fields from the JSON instead of scraping prose.
 - Use `--max-bytes` and `--no-examples` to keep payloads compact when needed.
@@ -487,6 +487,7 @@ Inspect, build, search, or clear the persistent index store:
 ```bash
 target/debug/rpeek index status
 target/debug/rpeek index package stats
+target/debug/rpeek index refresh stats
 target/debug/rpeek index show stats
 target/debug/rpeek index search stats reshape
 target/debug/rpeek index search stats '"predict" OR lm' --raw-match
@@ -519,7 +520,7 @@ Cache size defaults to 512 successful responses. Override it with `RPEEK_CACHE_E
 
 The persistent index path defaults to `~/.cache/rpeek/index.sqlite3` (or `XDG_CACHE_HOME` when set). Override it with `RPEEK_INDEX_PATH`.
 
-`index package` stores one package bundle in SQLite, including package metadata, exported signatures, help topics and examples, installed vignettes, and selected text files from the installed package tree. `index search` queries that stored bundle without round-tripping through R for each search, and now uses SQLite `bm25(...)` ranking with a title boost so obvious topic hits rise above long file matches.
+`index package` and `index refresh` store one package bundle in SQLite, including package metadata, exported signatures, help topics and examples, installed vignettes, and selected text files from the installed package tree. `index show` and `index search` refresh missing or stale package bundles before reading them. Their payloads include `freshness` (`fresh`, `refreshed`, or `stale_unrefreshable`) plus `refresh_reason` when a rebuild was needed. `index search` queries that stored bundle without round-tripping through R for each search, and now uses SQLite `bm25(...)` ranking with a title boost so obvious topic hits rise above long file matches.
 
 Package-scoped metadata and search commands such as `pkg`, `exports`, `objects`, `search`, `sigs`, `vignettes`, `vignette`, and `search-vignettes` will lazily build or refresh that package index on first access when you are using the daemon-backed CLI path.
 

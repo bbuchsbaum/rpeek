@@ -1,8 +1,8 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use rpeek::index::{
-    IndexStore, IndexedFile, IndexedPackageData, IndexedPackageRecord, IndexedSnippet,
-    IndexedTopic, IndexedVignette, NewSnippet, PackageIndexState, now_timestamp,
+    IndexStore, IndexedFile, IndexedPackageData, IndexedPackageRecord, IndexedPackageSummary,
+    IndexedSnippet, IndexedTopic, IndexedVignette, NewSnippet, PackageIndexState, now_timestamp,
 };
 use rpeek::protocol::Request;
 use rpeek::response::{
@@ -49,6 +49,7 @@ Examples:
   rpeek source dplyr mutate --grep \"%>%\" --context 2
   rpeek doc dplyr mutate
   rpeek doc dplyr::mutate
+  rpeek index refresh dplyr
   rpeek batch --file requests.jsonl
   rpeek agent";
 
@@ -98,6 +99,11 @@ enum Commands {
         kind: SearchKind,
         #[arg(long, default_value_t = 25)]
         limit: usize,
+        #[arg(
+            long,
+            help = "Disable fuzzy fallback when no substring matches are found"
+        )]
+        no_fuzzy: bool,
     },
     #[command(
         visible_alias = "searchall",
@@ -109,6 +115,11 @@ enum Commands {
         kind: SearchKind,
         #[arg(long, default_value_t = 25)]
         limit: usize,
+        #[arg(
+            long,
+            help = "Disable fuzzy fallback when no substring matches are found"
+        )]
+        no_fuzzy: bool,
     },
     #[command(about = "Resolve likely objects/topics from a query")]
     Resolve {
@@ -119,6 +130,11 @@ enum Commands {
         kind: SearchKind,
         #[arg(long, default_value_t = 10)]
         limit: usize,
+        #[arg(
+            long,
+            help = "Disable fuzzy fallback when no substring matches are found"
+        )]
+        no_fuzzy: bool,
     },
     #[command(visible_aliases = ["show", "info"], about = "One-call object summary")]
     Summary { package: String, name: String },
@@ -156,9 +172,17 @@ enum Commands {
         name: String,
         #[arg(long, help = "Return only the function signature")]
         args_only: bool,
-        #[arg(long, value_name = "N", help = "Limit returned text to the first N lines")]
+        #[arg(
+            long,
+            value_name = "N",
+            help = "Limit returned text to the first N lines"
+        )]
         head: Option<usize>,
-        #[arg(long, value_name = "PATTERN", help = "Keep only lines matching this pattern")]
+        #[arg(
+            long,
+            value_name = "PATTERN",
+            help = "Keep only lines matching this pattern"
+        )]
         grep: Option<String>,
         #[arg(
             long,
@@ -262,6 +286,8 @@ enum IndexCommands {
     Clear,
     #[command(about = "Index one installed package into the persistent store")]
     Package { package: String },
+    #[command(about = "Refresh one installed package in the persistent store")]
+    Refresh { package: String },
     #[command(about = "Show persistent indexed content counts for one package")]
     Show { package: String },
     #[command(about = "Search indexed docs, vignettes, examples, and files for one package")]
@@ -525,7 +551,10 @@ fn run() -> Result<Value> {
         } => Ok(index_clear_response()?),
         Commands::Index {
             command: IndexCommands::Package { package },
-        } => Ok(index_package_response(&package)?),
+        } => Ok(index_package_response(&package, "index_package")?),
+        Commands::Index {
+            command: IndexCommands::Refresh { package },
+        } => Ok(index_package_response(&package, "index_refresh")?),
         Commands::Index {
             command: IndexCommands::Show { package },
         } => Ok(index_show_response(&package)?),
@@ -581,27 +610,37 @@ fn request_from_command(command: Commands) -> Result<Request> {
             query,
             kind,
             limit,
+            no_fuzzy,
         } => Request::Search {
             package,
             query,
             kind: kind.as_request_value().to_string(),
             limit,
+            no_fuzzy,
         },
-        Commands::SearchAll { query, kind, limit } => Request::SearchAll {
+        Commands::SearchAll {
+            query,
+            kind,
+            limit,
+            no_fuzzy,
+        } => Request::SearchAll {
             query,
             kind: kind.as_request_value().to_string(),
             limit,
+            no_fuzzy,
         },
         Commands::Resolve {
             query,
             package,
             kind,
             limit,
+            no_fuzzy,
         } => Request::Resolve {
             query,
             package,
             kind: kind.as_request_value().to_string(),
             limit,
+            no_fuzzy,
         },
         Commands::Summary { package, name } => Request::Summary { package, name },
         Commands::Sig { package, name } => Request::Sig { package, name },
@@ -709,9 +748,7 @@ fn resolve_pkg_topic(package: String, topic: Option<String>) -> Result<(String, 
         return Ok((pkg.to_string(), name.to_string()));
     }
 
-    bail!(
-        "missing topic; pass `rpeek doc <package> <topic>` or `rpeek doc <package>::<topic>`"
-    );
+    bail!("missing topic; pass `rpeek doc <package> <topic>` or `rpeek doc <package>::<topic>`");
 }
 
 fn query_daemon(request: &Request, options: &ResponseOptions) -> Result<Value> {
@@ -1108,13 +1145,18 @@ fn indexed_request_response(cache: &ResponseCache, request: &Request) -> Result<
             "objects": package_data.objects,
         }),
         Request::Search {
-            query, kind, limit, ..
+            query,
+            kind,
+            limit,
+            no_fuzzy,
+            ..
         } => indexed_search_payload(
             &package_data,
             &cache.index.get_indexed_topics(package)?,
             query,
             kind,
             *limit,
+            *no_fuzzy,
         ),
         Request::Map { .. } => indexed_map_payload(
             &package_data,
@@ -1476,6 +1518,10 @@ fn agent_response() -> Value {
                     "command": "rpeek search --kind topic --limit 5 <package> <query>"
                 },
                 {
+                    "task": "Search without fuzzy fallback (substring-only)",
+                    "command": "rpeek search --no-fuzzy <package> <query>"
+                },
+                {
                     "task": "Find a symbol when you do not know the package",
                     "command": "rpeek search-all <query>"
                 },
@@ -1512,12 +1558,20 @@ fn agent_response() -> Value {
                     "command": "rpeek source <package> <object>"
                 },
                 {
+                    "task": "Read source filtered to a substring with surrounding context",
+                    "command": "rpeek source <package> <object> --grep <pattern> --context 5"
+                },
+                {
                     "task": "Read docs",
                     "command": "rpeek doc <package> <topic>"
                 },
                 {
                     "task": "Search installed package files and deparsed namespace objects",
                     "command": "rpeek grep <package> <query>"
+                },
+                {
+                    "task": "Refresh or inspect the persistent package index",
+                    "command": "rpeek index refresh <package>; rpeek index show <package>; rpeek index search <package> <query>"
                 },
                 {
                     "task": "Avoid daemon reuse for isolated checks",
@@ -1533,6 +1587,7 @@ fn agent_response() -> Value {
                 "Use RPEEK_SOCKET=/tmp/<name>.sock to reuse one warm daemon across calls.",
                 "Source kind can be raw_file, deparsed, or unavailable.",
                 "Use search-all for exported symbols and help topics when the package is unknown.",
+                "A stale package index is handled by rpeek index refresh/show/search; do not switch to Rscript just because freshness is stale.",
                 "Use --max-bytes and --no-examples to keep large payloads compact.",
                 "Batch input is JSON Lines matching the request schema.",
                 "Use rpeek schema request or rpeek schema response to inspect the JSON contract."
@@ -1541,51 +1596,105 @@ fn agent_response() -> Value {
     })
 }
 
-fn index_package_response(package: &str) -> Result<Value> {
+#[derive(Clone, Debug)]
+struct IndexFreshness {
+    status: &'static str,
+    refresh_reason: Option<String>,
+    previous_indexed_at: Option<i64>,
+    refresh_error: Option<String>,
+}
+
+impl IndexFreshness {
+    fn fresh() -> Self {
+        Self {
+            status: "fresh",
+            refresh_reason: None,
+            previous_indexed_at: None,
+            refresh_error: None,
+        }
+    }
+
+    fn refreshed(refresh_reason: String, previous_indexed_at: Option<i64>) -> Self {
+        Self {
+            status: "refreshed",
+            refresh_reason: Some(refresh_reason),
+            previous_indexed_at,
+            refresh_error: None,
+        }
+    }
+
+    fn stale_unrefreshable(
+        refresh_reason: String,
+        previous_indexed_at: Option<i64>,
+        refresh_error: anyhow::Error,
+    ) -> Self {
+        Self {
+            status: "stale_unrefreshable",
+            refresh_reason: Some(refresh_reason),
+            previous_indexed_at,
+            refresh_error: Some(refresh_error.to_string()),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct IndexRefreshDecision {
+    refresh_reason: Option<String>,
+    previous_indexed_at: Option<i64>,
+    has_stale_record: bool,
+}
+
+fn index_package_response(package: &str, command: &str) -> Result<Value> {
     let socket = env::temp_dir().join(format!(
         "rpeek-index-build-{}-{}.sock",
         std::process::id(),
         now_timestamp().unwrap_or_default()
     ));
-    let mut helper = HelperProcess::start(&socket)?;
-    let record = build_indexed_package_record(package, &mut helper, &socket)?;
     let mut store = IndexStore::open_default()?;
-    let fingerprint = package_fingerprint(&record.install_path)?;
-    let helper_fingerprint = record.version.clone();
-    let package = record.package.clone();
-    let indexed_at = record.indexed_at;
-
-    store.upsert_package_record(&record)?;
-    store.upsert_package_state(&PackageIndexState {
-        package: package.clone(),
-        install_path: record.install_path.clone(),
-        helper_fingerprint,
-        local_fingerprint: fingerprint,
-        updated_at: indexed_at,
-    })?;
+    let previous_indexed_at = store
+        .get_indexed_package_summary(package)?
+        .map(|summary| summary.indexed_at);
+    let mut helper = None;
+    let freshness = refresh_package_index(
+        &mut store,
+        package,
+        &mut helper,
+        &socket,
+        "explicit".to_string(),
+        previous_indexed_at,
+    )?;
 
     let summary = store
-        .get_indexed_package_summary(&package)?
+        .get_indexed_package_summary(package)?
         .ok_or_else(|| anyhow!("indexed package summary missing after write"))?;
+    let payload = indexed_package_summary_payload(&summary, &freshness)?;
 
     Ok(json!({
         "schema_version": 1,
         "ok": true,
-        "command": "index_package",
-        "payload": summary
+        "command": command,
+        "payload": payload
     }))
 }
 
 fn index_show_response(package: &str) -> Result<Value> {
-    let store = IndexStore::open_default()?;
+    let socket = env::temp_dir().join(format!(
+        "rpeek-index-show-{}-{}.sock",
+        std::process::id(),
+        now_timestamp().unwrap_or_default()
+    ));
+    let mut store = IndexStore::open_default()?;
+    let mut helper = None;
+    let freshness = ensure_package_index_fresh(&mut store, package, &mut helper, &socket, true)?;
     let summary = store
         .get_indexed_package_summary(package)?
         .ok_or_else(|| anyhow!("package '{package}' is not indexed"))?;
+    let payload = indexed_package_summary_payload(&summary, &freshness)?;
     Ok(json!({
         "schema_version": 1,
         "ok": true,
         "command": "index_show",
-        "payload": summary
+        "payload": payload
     }))
 }
 
@@ -1595,23 +1704,168 @@ fn index_search_response(
     limit: usize,
     raw_match: bool,
 ) -> Result<Value> {
-    let store = IndexStore::open_default()?;
+    let socket = env::temp_dir().join(format!(
+        "rpeek-index-search-{}-{}.sock",
+        std::process::id(),
+        now_timestamp().unwrap_or_default()
+    ));
+    let mut store = IndexStore::open_default()?;
+    let mut helper = None;
+    let freshness = ensure_package_index_fresh(&mut store, package, &mut helper, &socket, true)?;
     let match_query = rpeek::index::prepare_match_query(query, raw_match);
     let matches = store.search_package_documents(package, query, limit, raw_match)?;
+    let mut payload = json!({
+        "package": package,
+        "query": query,
+        "match_query": match_query,
+        "raw_match": raw_match,
+        "limit": limit,
+        "matches": matches,
+        "count": matches.len()
+    });
+    add_index_freshness_fields(&mut payload, &freshness);
     Ok(json!({
         "schema_version": 1,
         "ok": true,
         "command": "index_search",
-        "payload": {
-            "package": package,
-            "query": query,
-            "match_query": match_query,
-            "raw_match": raw_match,
-            "limit": limit,
-            "matches": matches,
-            "count": matches.len()
-        }
+        "payload": payload
     }))
+}
+
+fn ensure_package_index_fresh(
+    store: &mut IndexStore,
+    package: &str,
+    helper: &mut Option<HelperProcess>,
+    socket: &Path,
+    allow_stale_record_on_error: bool,
+) -> Result<IndexFreshness> {
+    let decision = assess_package_index_freshness(store, package)?;
+    let Some(refresh_reason) = decision.refresh_reason else {
+        return Ok(IndexFreshness::fresh());
+    };
+
+    match refresh_package_index(
+        store,
+        package,
+        helper,
+        socket,
+        refresh_reason.clone(),
+        decision.previous_indexed_at,
+    ) {
+        Ok(freshness) => Ok(freshness),
+        Err(err) if allow_stale_record_on_error && decision.has_stale_record => Ok(
+            IndexFreshness::stale_unrefreshable(refresh_reason, decision.previous_indexed_at, err),
+        ),
+        Err(err) => Err(err),
+    }
+}
+
+fn assess_package_index_freshness(
+    store: &IndexStore,
+    package: &str,
+) -> Result<IndexRefreshDecision> {
+    let state = store.get_package_state(package)?;
+    let summary = store.get_indexed_package_summary(package)?;
+    let previous_indexed_at = summary.as_ref().map(|summary| summary.indexed_at);
+    let has_stale_record = summary.is_some();
+
+    let refresh_reason = match (state, summary) {
+        (Some(state), Some(_summary)) => {
+            if !state.install_path.exists() {
+                Some("install_path_missing".to_string())
+            } else {
+                let current_fingerprint = package_fingerprint(&state.install_path)?;
+                if current_fingerprint == state.local_fingerprint {
+                    None
+                } else {
+                    Some("fingerprint_changed".to_string())
+                }
+            }
+        }
+        (Some(_state), None) => Some("missing_record".to_string()),
+        (None, Some(_summary)) => Some("missing_state".to_string()),
+        (None, None) => Some("not_indexed".to_string()),
+    };
+
+    Ok(IndexRefreshDecision {
+        refresh_reason,
+        previous_indexed_at,
+        has_stale_record,
+    })
+}
+
+fn refresh_package_index(
+    store: &mut IndexStore,
+    package: &str,
+    helper: &mut Option<HelperProcess>,
+    socket: &Path,
+    refresh_reason: String,
+    previous_indexed_at: Option<i64>,
+) -> Result<IndexFreshness> {
+    if helper.is_none() {
+        *helper = Some(HelperProcess::start(socket)?);
+    }
+    let helper_ref = helper
+        .as_mut()
+        .ok_or_else(|| anyhow!("failed to initialize indexing helper"))?;
+
+    let record = build_indexed_package_record(package, helper_ref, socket)?;
+    let fingerprint = package_fingerprint(&record.install_path)?;
+    let helper_fingerprint = record.version.clone();
+    let package = record.package.clone();
+    let install_path = record.install_path.clone();
+    let indexed_at = record.indexed_at;
+
+    store.upsert_package_record(&record)?;
+    store.upsert_package_state(&PackageIndexState {
+        package,
+        install_path,
+        helper_fingerprint,
+        local_fingerprint: fingerprint,
+        updated_at: indexed_at,
+    })?;
+
+    Ok(IndexFreshness::refreshed(
+        refresh_reason,
+        previous_indexed_at,
+    ))
+}
+
+fn indexed_package_summary_payload(
+    summary: &IndexedPackageSummary,
+    freshness: &IndexFreshness,
+) -> Result<Value> {
+    let mut payload = serde_json::to_value(summary)?;
+    add_index_freshness_fields(&mut payload, freshness);
+    Ok(payload)
+}
+
+fn add_index_freshness_fields(payload: &mut Value, freshness: &IndexFreshness) {
+    let Some(map) = payload.as_object_mut() else {
+        return;
+    };
+    map.insert(
+        "freshness".to_string(),
+        Value::String(freshness.status.to_string()),
+    );
+    if let Some(refresh_reason) = freshness.refresh_reason.as_deref() {
+        map.insert(
+            "refresh_reason".to_string(),
+            Value::String(refresh_reason.to_string()),
+        );
+    }
+    if let Some(previous_indexed_at) = freshness.previous_indexed_at {
+        map.insert(
+            "previous_indexed_at".to_string(),
+            Value::Number(previous_indexed_at.into()),
+        );
+    }
+    if let Some(refresh_error) = freshness.refresh_error.as_deref() {
+        map.insert(
+            "refresh_error".to_string(),
+            Value::String(refresh_error.to_string()),
+        );
+    }
 }
 
 fn snippet_response(command: SnippetCommands) -> Result<Value> {
@@ -2586,40 +2840,7 @@ fn ensure_packages_indexed(packages: &[String]) -> Result<IndexStore> {
         if !seen.insert(package.clone()) {
             continue;
         }
-        let package_name = package.as_str();
-        let needs_index = match (
-            store.get_package_state(package_name)?,
-            store.get_indexed_package_summary(package_name)?,
-        ) {
-            (Some(state), Some(_)) if state.install_path.exists() => {
-                package_fingerprint(&state.install_path)? != state.local_fingerprint
-            }
-            _ => true,
-        };
-
-        if !needs_index {
-            continue;
-        }
-
-        if helper.is_none() {
-            helper = Some(HelperProcess::start(&socket)?);
-        }
-        let helper_ref = helper
-            .as_mut()
-            .ok_or_else(|| anyhow!("failed to initialize indexing helper"))?;
-        let record = build_indexed_package_record(package_name, helper_ref, &socket)?;
-        let fingerprint = package_fingerprint(&record.install_path)?;
-        let install_path = record.install_path.clone();
-        let helper_fingerprint = record.version.clone();
-        let indexed_at = record.indexed_at;
-        store.upsert_package_record(&record)?;
-        store.upsert_package_state(&PackageIndexState {
-            package: package_name.to_string(),
-            install_path,
-            helper_fingerprint,
-            local_fingerprint: fingerprint,
-            updated_at: indexed_at,
-        })?;
+        ensure_package_index_fresh(&mut store, package, &mut helper, &socket, false)?;
     }
 
     Ok(store)
@@ -3188,6 +3409,7 @@ fn indexed_search_payload(
     query: &str,
     kind: &str,
     limit: usize,
+    no_fuzzy: bool,
 ) -> Value {
     let limit = limit.max(1).min(100);
     let query_lower = query.to_ascii_lowercase();
@@ -3198,6 +3420,7 @@ fn indexed_search_payload(
             &package_data.objects,
             &query_lower,
             limit,
+            no_fuzzy,
             |name, matched_by| {
                 json!({
                     "kind": "object",
@@ -3216,13 +3439,19 @@ fn indexed_search_payload(
         .map(|topic| topic.topic.as_str())
         .collect::<Vec<_>>();
     let topic_matches = if matches!(kind, "all" | "topic") {
-        ranked_matches(&topic_names, &query_lower, limit, |topic, matched_by| {
-            json!({
-                "kind": "topic",
-                "topic": topic,
-                "matched_by": matched_by,
-            })
-        })
+        ranked_matches(
+            &topic_names,
+            &query_lower,
+            limit,
+            no_fuzzy,
+            |topic, matched_by| {
+                json!({
+                    "kind": "topic",
+                    "topic": topic,
+                    "matched_by": matched_by,
+                })
+            },
+        )
     } else {
         RankedMatches::empty()
     };
@@ -3581,6 +3810,7 @@ fn ranked_matches<F>(
     candidates: &[impl AsRef<str>],
     query_lower: &str,
     limit: usize,
+    no_fuzzy: bool,
     builder: F,
 ) -> RankedMatches
 where
@@ -3601,6 +3831,12 @@ where
         .filter(|label| contains_ignore_case(label, query_lower))
         .collect::<Vec<_>>();
     let (pool, matched_by) = if substring.is_empty() {
+        if no_fuzzy {
+            return RankedMatches {
+                matches: Vec::new(),
+                total: 0,
+            };
+        }
         let mut ranked = labels;
         ranked.sort_by_cached_key(|label| rank_tuple(label, query_lower));
         (
@@ -4095,8 +4331,7 @@ mod tests {
 
     #[test]
     fn resolve_pkg_topic_accepts_separate_args() {
-        let (pkg, topic) =
-            resolve_pkg_topic("stats".to_string(), Some("lm".to_string())).unwrap();
+        let (pkg, topic) = resolve_pkg_topic("stats".to_string(), Some("lm".to_string())).unwrap();
         assert_eq!(pkg, "stats");
         assert_eq!(topic, "lm");
     }
@@ -4110,8 +4345,7 @@ mod tests {
 
     #[test]
     fn resolve_pkg_topic_rejects_mixed_forms() {
-        let err =
-            resolve_pkg_topic("stats::lm".to_string(), Some("glm".to_string())).unwrap_err();
+        let err = resolve_pkg_topic("stats::lm".to_string(), Some("glm".to_string())).unwrap_err();
         assert!(err.to_string().contains("ambiguous"));
     }
 

@@ -1015,7 +1015,7 @@ help_topic_summary <- function(package, topic) {
   )
 }
 
-search_matches <- function(candidates, query, limit, builder) {
+search_matches <- function(candidates, query, limit, builder, no_fuzzy = FALSE) {
   candidates <- unique(candidates[nzchar(candidates)])
   if (!length(candidates)) {
     return(list(matches = list(), total = 0, matched_by = "none"))
@@ -1028,6 +1028,9 @@ search_matches <- function(candidates, query, limit, builder) {
   pool <- substring_matches
 
   if (!length(pool)) {
+    if (isTRUE(no_fuzzy)) {
+      return(list(matches = list(), total = 0, matched_by = matched_by))
+    }
     matched_by <- "fuzzy"
     pool <- head(rank_candidates(candidates, query), max(limit * 3, limit))
   }
@@ -1061,7 +1064,7 @@ rank_record_indices <- function(records, query) {
   order(!exact, !prefix, !contains, distances, nchar(labels), packages, labels)
 }
 
-search_record_matches <- function(records, query, limit) {
+search_record_matches <- function(records, query, limit, no_fuzzy = FALSE) {
   if (!length(records)) {
     return(list(matches = list(), total = 0, matched_by = "none"))
   }
@@ -1074,6 +1077,9 @@ search_record_matches <- function(records, query, limit) {
   pool <- substring_idx
 
   if (!length(pool)) {
+    if (isTRUE(no_fuzzy)) {
+      return(list(matches = list(), total = 0, matched_by = matched_by))
+    }
     matched_by <- "fuzzy"
     ordered <- rank_record_indices(records, query)
     pool <- head(ordered, max(limit * 3, limit))
@@ -1092,7 +1098,7 @@ search_record_matches <- function(records, query, limit) {
   )
 }
 
-search_all_packages <- function(query, kind = "all", limit = 25) {
+search_all_packages <- function(query, kind = "all", limit = 25, no_fuzzy = FALSE) {
   kind <- match.arg(kind, c("all", "object", "topic"))
   limit <- suppressWarnings(as.integer(limit))
   if (is.na(limit) || limit < 1) {
@@ -1134,8 +1140,8 @@ search_all_packages <- function(query, kind = "all", limit = 25) {
     }
   }
 
-  object_results <- search_record_matches(object_records, query, limit)
-  topic_results <- search_record_matches(topic_records, query, limit)
+  object_results <- search_record_matches(object_records, query, limit, no_fuzzy = no_fuzzy)
+  topic_results <- search_record_matches(topic_records, query, limit, no_fuzzy = no_fuzzy)
   matches <- c(object_results$matches, topic_results$matches)
   if (length(matches)) {
     matches <- unname(matches[rank_record_indices(matches, query)])
@@ -1163,7 +1169,7 @@ search_all_packages <- function(query, kind = "all", limit = 25) {
   )
 }
 
-search_package <- function(package, query, kind = "all", limit = 25) {
+search_package <- function(package, query, kind = "all", limit = 25, no_fuzzy = FALSE) {
   normalize_package(package)
   kind <- match.arg(kind, c("all", "object", "topic"))
   limit <- suppressWarnings(as.integer(limit))
@@ -1186,7 +1192,7 @@ search_package <- function(package, query, kind = "all", limit = 25) {
         exported = name %in% getNamespaceExports(package),
         matched_by = matched_by
       )
-    })
+    }, no_fuzzy = no_fuzzy)
   }
 
   if (kind %in% c("all", "topic")) {
@@ -1196,7 +1202,7 @@ search_package <- function(package, query, kind = "all", limit = 25) {
         topic = topic,
         matched_by = matched_by
       )
-    })
+    }, no_fuzzy = no_fuzzy)
   }
 
   list(
@@ -1230,7 +1236,7 @@ enrich_resolve_match <- function(record) {
   record
 }
 
-resolve_query <- function(query, package = NULL, kind = "all", limit = 10) {
+resolve_query <- function(query, package = NULL, kind = "all", limit = 10, no_fuzzy = FALSE) {
   kind <- match.arg(kind, c("all", "object", "topic"))
   limit <- suppressWarnings(as.integer(limit))
   if (is.na(limit) || limit < 1) {
@@ -1239,7 +1245,7 @@ resolve_query <- function(query, package = NULL, kind = "all", limit = 10) {
   limit <- min(limit, 50)
 
   base <- if (!is.null(package) && nzchar(package)) {
-    result <- search_package(package, query, kind = kind, limit = limit)
+    result <- search_package(package, query, kind = kind, limit = limit, no_fuzzy = no_fuzzy)
     result$matches <- lapply(result$matches, function(record) {
       record$package <- package
       record
@@ -1247,7 +1253,7 @@ resolve_query <- function(query, package = NULL, kind = "all", limit = 10) {
     result$scope <- "package"
     result
   } else {
-    search_all_packages(query, kind = kind, limit = limit)
+    search_all_packages(query, kind = kind, limit = limit, no_fuzzy = no_fuzzy)
   }
 
   matches <- base$matches
@@ -1443,6 +1449,7 @@ dispatch <- function(req) {
   topic <- req[["topic"]]
   glob <- req[["glob"]]
   scope <- req[["scope"]] %||% "all"
+  no_fuzzy <- isTRUE(req[["no_fuzzy"]])
 
   payload <- switch(
     req[["action"]],
@@ -1455,9 +1462,9 @@ dispatch <- function(req) {
     "pkg" = package_description(package),
     "exports" = list(package = package, exports = list_objects(package, TRUE)),
     "objects" = list(package = package, objects = list_objects(package, FALSE)),
-    "search" = search_package(package, query, kind = kind, limit = limit),
-    "search_all" = search_all_packages(query, kind = kind, limit = limit),
-    "resolve" = resolve_query(query, package = package, kind = kind, limit = limit),
+    "search" = search_package(package, query, kind = kind, limit = limit, no_fuzzy = no_fuzzy),
+    "search_all" = search_all_packages(query, kind = kind, limit = limit, no_fuzzy = no_fuzzy),
+    "resolve" = resolve_query(query, package = package, kind = kind, limit = limit, no_fuzzy = no_fuzzy),
     "summary" = summary_for_object(package, name),
     "sig" = object_info(package, name),
     "sigs" = package_signatures(package, all_objects = req[["all_objects"]] %||% FALSE),

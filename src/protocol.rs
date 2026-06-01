@@ -59,6 +59,9 @@ pub enum Request {
         kind: String,
         /// Maximum matches to return.
         limit: usize,
+        /// Disable fuzzy fallback when no substring matches are found.
+        #[serde(default, skip_serializing_if = "is_false")]
+        no_fuzzy: bool,
     },
     /// Search exports/help topics across installed packages.
     SearchAll {
@@ -68,6 +71,9 @@ pub enum Request {
         kind: String,
         /// Maximum matches to return.
         limit: usize,
+        /// Disable fuzzy fallback when no substring matches are found.
+        #[serde(default, skip_serializing_if = "is_false")]
+        no_fuzzy: bool,
     },
     /// Resolve likely object/topic candidates for a query.
     Resolve {
@@ -80,6 +86,9 @@ pub enum Request {
         kind: String,
         /// Maximum candidates to return.
         limit: usize,
+        /// Disable fuzzy fallback when no substring matches are found.
+        #[serde(default, skip_serializing_if = "is_false")]
+        no_fuzzy: bool,
     },
     /// Return a compact summary for one object.
     Summary {
@@ -316,6 +325,10 @@ impl Request {
     }
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,6 +351,7 @@ mod tests {
             package: None,
             kind: "all".to_string(),
             limit: 10,
+            no_fuzzy: false,
         };
 
         assert!(!request.requires_package());
