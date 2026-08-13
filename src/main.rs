@@ -16,6 +16,8 @@ use std::env;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -26,6 +28,8 @@ use std::time::{Duration, Instant};
 const SOCKET_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const HEALTHCHECK_TIMEOUT: Duration = Duration::from_millis(500);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_HELPER_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const INDEX_TEXT_FILE_LIMIT: u64 = 512 * 1024;
 const HELPER_SCRIPT: &str = include_str!("r_helper.R");
 const AFTER_HELP: &str = "\
@@ -269,12 +273,17 @@ enum Commands {
     Serve {
         #[arg(long)]
         socket: PathBuf,
+        #[arg(long, hide = true)]
+        generation: Option<String>,
     },
 }
 
 #[derive(Debug, Subcommand)]
 enum CacheCommands {
-    Clear,
+    Clear {
+        #[arg(long, help = "Also stop the R helper and release loaded package files")]
+        release: bool,
+    },
     Stats,
 }
 
@@ -404,6 +413,8 @@ enum DaemonCommands {
     Stop,
     #[command(about = "Restart the daemon")]
     Restart,
+    #[command(about = "Release the R helper without stopping the Rust daemon")]
+    ResetHelper,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -529,8 +540,9 @@ fn run() -> Result<Value> {
         no_examples: cli.no_examples,
     };
     match cli.command {
-        Commands::Serve { socket } => {
-            serve(socket)?;
+        Commands::Serve { socket, generation } => {
+            let generation = generation.unwrap_or(current_executable_generation()?);
+            serve(socket, generation)?;
             Ok(json!({
                 "schema_version": 1,
                 "ok": true,
@@ -708,7 +720,8 @@ fn request_from_command(command: Commands) -> Result<Request> {
             limit,
         },
         Commands::Cache { command } => match command {
-            CacheCommands::Clear => Request::CacheClear,
+            CacheCommands::Clear { release: true } => Request::HelperReset,
+            CacheCommands::Clear { release: false } => Request::CacheClear,
             CacheCommands::Stats => Request::CacheStats,
         },
         Commands::Index { .. } => bail!("index is not a daemon command"),
@@ -721,6 +734,7 @@ fn request_from_command(command: Commands) -> Result<Request> {
             DaemonCommands::Status => Request::DaemonStatus,
             DaemonCommands::Stop => Request::Shutdown,
             DaemonCommands::Restart => bail!("daemon restart is handled directly"),
+            DaemonCommands::ResetHelper => Request::HelperReset,
         },
         Commands::Serve { .. } => bail!("serve is not a client command"),
         Commands::Doctor => bail!("doctor is not a client command"),
@@ -753,13 +767,27 @@ fn resolve_pkg_topic(package: String, topic: Option<String>) -> Result<(String, 
 
 fn query_daemon(request: &Request, options: &ResponseOptions) -> Result<Value> {
     let socket = socket_path();
-    if matches!(request, Request::Shutdown) && !socket.exists() {
-        return Ok(json!({
-            "schema_version": 1,
-            "ok": true,
-            "command": "shutdown",
-            "payload": { "status": "not_running" }
-        }));
+    if matches!(request, Request::Shutdown) {
+        if !socket.exists() {
+            return Ok(json!({
+                "schema_version": 1,
+                "ok": true,
+                "command": "shutdown",
+                "payload": { "status": "not_running" }
+            }));
+        }
+
+        let response = send_shutdown(&socket)?;
+        let mut value: Value = serde_json::from_str(response.trim())
+            .with_context(|| format!("invalid JSON response from daemon: {response}"))?;
+        if let Some(map) = value.as_object_mut() {
+            map.insert(
+                "command".to_string(),
+                Value::String(request.action().to_string()),
+            );
+        }
+        apply_response_options(&mut value, options);
+        return Ok(value);
     }
 
     ensure_daemon_running(&socket)?;
@@ -841,8 +869,38 @@ fn query_helper_payload(
 }
 
 fn ensure_daemon_running(socket: &Path) -> Result<()> {
+    if using_default_socket() {
+        retire_legacy_daemons(socket);
+    }
+
+    let generation = current_executable_generation()?;
     if socket.exists() {
-        return Ok(());
+        let recorded_generation = match read_daemon_generation(socket) {
+            Some(generation) => Some(generation),
+            None => match daemon_generation(socket) {
+                Ok(generation) => generation,
+                Err(err) if UnixStream::connect(socket).is_ok() => {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "failed to verify generation of existing daemon at {}; it may be busy and was not unlinked",
+                            socket.display()
+                        )
+                    });
+                }
+                Err(_) => {
+                    fs::remove_file(socket).with_context(|| {
+                        format!("failed to remove stale daemon socket {}", socket.display())
+                    })?;
+                    None
+                }
+            },
+        };
+        if socket.exists() && recorded_generation.as_deref() == Some(generation.as_str()) {
+            return Ok(());
+        }
+        if socket.exists() {
+            retire_daemon_at(socket)?;
+        }
     }
 
     let lock_path = socket_lock_path(socket);
@@ -863,6 +921,8 @@ fn ensure_daemon_running(socket: &Path) -> Result<()> {
             .arg("serve")
             .arg("--socket")
             .arg(socket)
+            .arg("--generation")
+            .arg(&generation)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -896,6 +956,68 @@ fn ensure_daemon_running(socket: &Path) -> Result<()> {
         "daemon did not become ready within {}ms",
         SOCKET_WAIT_TIMEOUT.as_millis()
     );
+}
+
+fn daemon_generation(socket: &Path) -> Result<Option<String>> {
+    if !socket.exists() {
+        return Ok(None);
+    }
+    let line = serde_json::to_string(&Request::DaemonStatus)?;
+    let response = send_request_line(socket, &line, REQUEST_TIMEOUT)?;
+    let value: Value = serde_json::from_str(&response)?;
+    Ok(value
+        .get("payload")
+        .and_then(|payload| payload.get("generation"))
+        .and_then(Value::as_str)
+        .map(str::to_string))
+}
+
+fn read_daemon_generation(socket: &Path) -> Option<String> {
+    fs::read_to_string(daemon_generation_path(socket))
+        .ok()
+        .map(|generation| generation.trim().to_string())
+        .filter(|generation| !generation.is_empty())
+}
+
+fn retire_daemon_at(socket: &Path) -> Result<()> {
+    if !socket.exists() {
+        return Ok(());
+    }
+
+    match send_shutdown_with_timeout(socket, REQUEST_TIMEOUT) {
+        Ok(_) => {
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(2) {
+                if !socket.exists() {
+                    return Ok(());
+                }
+                thread::sleep(DAEMON_POLL_INTERVAL);
+            }
+            if UnixStream::connect(socket).is_ok() {
+                bail!(
+                    "existing daemon at {} did not stop during executable upgrade",
+                    socket.display()
+                );
+            }
+        }
+        Err(err) => {
+            if UnixStream::connect(socket).is_ok() {
+                return Err(err).with_context(|| {
+                    format!(
+                        "existing daemon at {} is still accepting connections and was not unlinked",
+                        socket.display()
+                    )
+                });
+            }
+        }
+    }
+
+    if socket.exists() {
+        fs::remove_file(socket).with_context(|| {
+            format!("failed to remove stale daemon socket {}", socket.display())
+        })?;
+    }
+    Ok(())
 }
 
 fn daemon_is_healthy(socket: &Path) -> bool {
@@ -951,7 +1073,7 @@ fn recover_daemon(socket: &Path) -> Result<()> {
         bail!("daemon is healthy but the request failed or timed out");
     }
 
-    let _ = send_shutdown(socket);
+    let _ = send_shutdown_with_timeout(socket, HEALTHCHECK_TIMEOUT);
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(2) {
         if !socket.exists() {
@@ -970,11 +1092,27 @@ fn recover_daemon(socket: &Path) -> Result<()> {
 }
 
 fn send_shutdown(socket: &Path) -> Result<String> {
-    let line = serde_json::to_string(&Request::Shutdown)?;
-    send_request_line(socket, &line, HEALTHCHECK_TIMEOUT)
+    send_shutdown_with_timeout(socket, REQUEST_TIMEOUT)
 }
 
-fn serve(socket: PathBuf) -> Result<()> {
+fn send_shutdown_with_timeout(socket: &Path, timeout: Duration) -> Result<String> {
+    let line = serde_json::to_string(&Request::Shutdown)?;
+    send_request_line(socket, &line, timeout)
+}
+
+struct DaemonFilesGuard {
+    socket: PathBuf,
+    generation: PathBuf,
+}
+
+impl Drop for DaemonFilesGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.socket);
+        let _ = fs::remove_file(&self.generation);
+    }
+}
+
+fn serve(socket: PathBuf, generation: String) -> Result<()> {
     if socket.exists() {
         let _ = fs::remove_file(&socket);
     }
@@ -986,18 +1124,42 @@ fn serve(socket: PathBuf) -> Result<()> {
 
     let listener = UnixListener::bind(&socket)
         .with_context(|| format!("failed to bind daemon socket at {}", socket.display()))?;
-    let mut helper = HelperProcess::start(&socket)?;
+    let generation_path = daemon_generation_path(&socket);
+    let _daemon_files = DaemonFilesGuard {
+        socket: socket.clone(),
+        generation: generation_path.clone(),
+    };
+    fs::write(&generation_path, &generation).with_context(|| {
+        format!(
+            "failed to write daemon generation file {}",
+            generation_path.display()
+        )
+    })?;
+    listener
+        .set_nonblocking(true)
+        .context("failed to configure daemon listener")?;
+    let mut helper = HelperProcess::dormant(&socket);
     let mut cache = ResponseCache::new()?;
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(mut stream) => {
+    loop {
+        match listener.accept() {
+            Ok((mut stream, _address)) => {
+                stream
+                    .set_nonblocking(false)
+                    .context("failed to configure daemon client stream")?;
                 let mut should_shutdown = false;
                 let response = match read_request_line(&mut stream).and_then(|line| {
                     let request: Request =
                         serde_json::from_str(&line).context("failed to parse client request")?;
                     should_shutdown = matches!(request, Request::Shutdown);
-                    handle_request(&request, &line, &mut helper, &mut cache, &socket)
+                    handle_request(
+                        &request,
+                        &line,
+                        &mut helper,
+                        &mut cache,
+                        &socket,
+                        &generation,
+                    )
                 }) {
                     Ok(response) => response,
                     Err(err) => json!({
@@ -1016,11 +1178,14 @@ fn serve(socket: PathBuf) -> Result<()> {
                     break;
                 }
             }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                helper.reap_if_idle();
+                thread::sleep(DAEMON_POLL_INTERVAL);
+            }
             Err(err) => return Err(err).context("failed to accept daemon connection"),
         }
     }
 
-    let _ = fs::remove_file(&socket);
     Ok(())
 }
 
@@ -1030,6 +1195,7 @@ fn handle_request(
     helper: &mut HelperProcess,
     cache: &mut ResponseCache,
     socket: &Path,
+    generation: &str,
 ) -> Result<String> {
     match request {
         Request::Ping => Ok(json!({
@@ -1038,7 +1204,7 @@ fn handle_request(
             "payload": { "status": "ok" }
         })
         .to_string()),
-        Request::DaemonStatus => Ok(daemon_status_response(cache, helper, socket)),
+        Request::DaemonStatus => Ok(daemon_status_response(cache, helper, socket, generation)),
         Request::Shutdown => Ok(json!({
             "schema_version": 1,
             "ok": true,
@@ -1047,6 +1213,10 @@ fn handle_request(
         .to_string()),
         Request::CacheClear => Ok(cache.clear_response()),
         Request::CacheStats => Ok(cache.stats_response()),
+        Request::HelperReset => {
+            let helper_released = helper.release();
+            Ok(cache.reset_helper_response(helper_released))
+        }
         _ => handle_query_request(request, line, helper, cache, socket),
     }
 }
@@ -1055,7 +1225,9 @@ fn daemon_status_response(
     cache: &ResponseCache,
     helper: &mut HelperProcess,
     socket: &Path,
+    generation: &str,
 ) -> String {
+    let helper_status = helper.status_payload();
     json!({
         "schema_version": 1,
         "ok": true,
@@ -1063,7 +1235,9 @@ fn daemon_status_response(
             "status": "running",
             "pid": std::process::id(),
             "socket": socket.display().to_string(),
-            "helper_alive": helper.is_alive(),
+            "generation": generation,
+            "helper_alive": helper_status["alive"],
+            "helper": helper_status,
             "cache": cache.stats_payload(),
             "index": cache.index_payload()
         }
@@ -1243,7 +1417,7 @@ fn read_request_line(stream: &mut UnixStream) -> Result<String> {
     Ok(line.trim().to_string())
 }
 
-struct HelperProcess {
+struct RProcess {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
@@ -1251,7 +1425,7 @@ struct HelperProcess {
     script_path: PathBuf,
 }
 
-impl HelperProcess {
+impl RProcess {
     fn start(socket: &Path) -> Result<Self> {
         let script_path = helper_script_path(socket);
         fs::write(&script_path, HELPER_SCRIPT)
@@ -1305,14 +1479,6 @@ impl HelperProcess {
         Ok(helper)
     }
 
-    fn restart(&mut self, socket: &Path, request: &str) -> Result<String> {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let replacement = Self::start(socket)?;
-        *self = replacement;
-        self.send(request)
-    }
-
     fn send(&mut self, request: &str) -> Result<String> {
         self.stdin.write_all(request.as_bytes())?;
         self.stdin.write_all(b"\n")?;
@@ -1341,6 +1507,10 @@ impl HelperProcess {
         matches!(self.child.try_wait(), Ok(None))
     }
 
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     fn read_stderr(&mut self) -> String {
         let mut stderr = String::new();
         let _ = self.stderr.read_to_string(&mut stderr);
@@ -1348,11 +1518,128 @@ impl HelperProcess {
     }
 }
 
-impl Drop for HelperProcess {
+impl Drop for RProcess {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = fs::remove_file(&self.script_path);
+    }
+}
+
+struct HelperProcess {
+    process: Option<RProcess>,
+    socket: PathBuf,
+    last_used: Option<Instant>,
+    idle_timeout: Option<Duration>,
+    starts: u64,
+    restarts: u64,
+    idle_reaps: u64,
+    manual_releases: u64,
+}
+
+impl HelperProcess {
+    fn start(socket: &Path) -> Result<Self> {
+        let mut helper = Self::dormant(socket);
+        helper.ensure_running()?;
+        Ok(helper)
+    }
+
+    fn dormant(socket: &Path) -> Self {
+        let idle_timeout = env::var("RPEEK_HELPER_IDLE_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .or(Some(DEFAULT_HELPER_IDLE_TIMEOUT));
+        let idle_timeout = idle_timeout.filter(|timeout| !timeout.is_zero());
+        Self {
+            process: None,
+            socket: socket.to_path_buf(),
+            last_used: None,
+            idle_timeout,
+            starts: 0,
+            restarts: 0,
+            idle_reaps: 0,
+            manual_releases: 0,
+        }
+    }
+
+    fn ensure_running(&mut self) -> Result<&mut RProcess> {
+        let alive = self
+            .process
+            .as_mut()
+            .is_some_and(|process| process.is_alive());
+        if !alive {
+            self.process.take();
+            self.process = Some(RProcess::start(&self.socket)?);
+            self.starts += 1;
+        }
+        self.last_used = Some(Instant::now());
+        self.process
+            .as_mut()
+            .ok_or_else(|| anyhow!("failed to initialize R helper"))
+    }
+
+    fn send(&mut self, request: &str) -> Result<String> {
+        let response = self.ensure_running()?.send(request);
+        self.last_used = Some(Instant::now());
+        response
+    }
+
+    fn restart(&mut self, _socket: &Path, request: &str) -> Result<String> {
+        self.restart_process()?;
+        self.send(request)
+    }
+
+    fn restart_process(&mut self) -> Result<()> {
+        self.process.take();
+        self.restarts += 1;
+        self.ensure_running()?;
+        Ok(())
+    }
+
+    fn release(&mut self) -> bool {
+        let released = self.process.take().is_some();
+        if released {
+            self.manual_releases += 1;
+        }
+        self.last_used = None;
+        released
+    }
+
+    fn reap_if_idle(&mut self) -> bool {
+        let Some(timeout) = self.idle_timeout else {
+            return false;
+        };
+        let Some(last_used) = self.last_used else {
+            return false;
+        };
+        if self.process.is_some() && last_used.elapsed() >= timeout {
+            self.process.take();
+            self.last_used = None;
+            self.idle_reaps += 1;
+            return true;
+        }
+        false
+    }
+
+    fn is_alive(&mut self) -> bool {
+        self.process
+            .as_mut()
+            .is_some_and(|process| process.is_alive())
+    }
+
+    fn status_payload(&mut self) -> Value {
+        let alive = self.is_alive();
+        let pid = self.process.as_ref().filter(|_| alive).map(RProcess::pid);
+        json!({
+            "alive": alive,
+            "pid": pid,
+            "idle_timeout_seconds": self.idle_timeout.map(|timeout| timeout.as_secs()),
+            "starts": self.starts,
+            "restarts": self.restarts,
+            "idle_reaps": self.idle_reaps,
+            "manual_releases": self.manual_releases,
+        })
     }
 }
 
@@ -1364,15 +1651,60 @@ fn socket_path() -> PathBuf {
         return PathBuf::from(path);
     }
 
+    default_socket_path()
+}
+
+fn using_default_socket() -> bool {
+    env::var_os("RPEEK_SOCKET").is_none() && env::var_os("RPKG_SOCKET").is_none()
+}
+
+fn default_socket_path() -> PathBuf {
     let user = env::var("USER").unwrap_or_else(|_| "user".to_string());
-    let build_tag = env::current_exe()
-        .ok()
-        .and_then(|path| fs::metadata(path).ok())
-        .and_then(|metadata| metadata.modified().ok())
-        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs().to_string())
-        .unwrap_or_else(|| "dev".to_string());
-    env::temp_dir().join(format!("rpeek-{user}-{build_tag}.sock"))
+    env::temp_dir().join(format!("rpeek-{user}.sock"))
+}
+
+fn current_executable_generation() -> Result<String> {
+    let path = env::current_exe().context("failed to resolve current executable")?;
+    let metadata = fs::metadata(&path)
+        .with_context(|| format!("failed to stat current executable {}", path.display()))?;
+    Ok(format!(
+        "{}:{}:{}:{}:{}",
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec()
+    ))
+}
+
+fn retire_legacy_daemons(current_socket: &Path) {
+    let user = env::var("USER").unwrap_or_else(|_| "user".to_string());
+    let prefix = format!("rpeek-{user}-");
+    let Ok(entries) = fs::read_dir(env::temp_dir()) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == current_socket {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(tag) = name
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.strip_suffix(".sock"))
+        else {
+            continue;
+        };
+        if tag != "dev" && !tag.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        if daemon_is_healthy(&path) {
+            let _ = send_shutdown(&path);
+        }
+    }
 }
 
 fn helper_script_path(socket: &Path) -> PathBuf {
@@ -1381,6 +1713,14 @@ fn helper_script_path(socket: &Path) -> PathBuf {
         .and_then(|value| value.to_str())
         .unwrap_or("rpeek");
     socket.with_file_name(format!("{stem}-helper.R"))
+}
+
+fn daemon_generation_path(socket: &Path) -> PathBuf {
+    let name = socket
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("rpeek.sock");
+    socket.with_file_name(format!("{name}.generation"))
 }
 
 fn socket_lock_path(socket: &Path) -> PathBuf {
@@ -1578,6 +1918,10 @@ fn agent_response() -> Value {
                     "command": "rpeek --no-daemon summary <package> <object>"
                 },
                 {
+                    "task": "Release loaded package files before installation",
+                    "command": "rpeek cache clear --release"
+                },
+                {
                     "task": "Run multiple requests",
                     "command": "rpeek batch --file requests.jsonl"
                 }
@@ -1585,6 +1929,7 @@ fn agent_response() -> Value {
             "notes": [
                 "JSON is the default output format.",
                 "Use RPEEK_SOCKET=/tmp/<name>.sock to reuse one warm daemon across calls.",
+                "The R helper is restarted when an installed package changes and reaped after its idle timeout.",
                 "Source kind can be raw_file, deparsed, or unavailable.",
                 "Use search-all for exported symbols and help topics when the package is unknown.",
                 "A stale package index is handled by rpeek index refresh/show/search; do not switch to Rscript just because freshness is stale.",
@@ -4059,6 +4404,26 @@ impl ResponseCache {
         .to_string()
     }
 
+    fn reset_helper_response(&mut self, helper_released: bool) -> String {
+        let cleared_entries = self.entries.len();
+        let cleared_packages = self.packages.len();
+        self.entries.clear();
+        self.order.clear();
+        self.packages.clear();
+
+        json!({
+            "schema_version": 1,
+            "ok": true,
+            "payload": {
+                "status": "helper_reset",
+                "helper_released": helper_released,
+                "cleared_entries": cleared_entries,
+                "cleared_packages": cleared_packages
+            }
+        })
+        .to_string()
+    }
+
     fn stats_payload(&self) -> Value {
         json!({
             "entries": self.entries.len(),
@@ -4114,6 +4479,9 @@ impl ResponseCache {
 
             let helper_fingerprint = state.helper_fingerprint.clone();
             self.invalidate_package(package);
+            helper.restart_process().with_context(|| {
+                format!("failed to restart R helper after package '{package}' changed")
+            })?;
             return self.refresh_package_state(package, helper_fingerprint, helper, socket);
         }
 
@@ -4134,6 +4502,9 @@ impl ResponseCache {
             }
 
             self.invalidate_package(package);
+            helper.restart_process().with_context(|| {
+                format!("failed to restart R helper after package '{package}' changed")
+            })?;
             return self.refresh_package_state(package, state.helper_fingerprint, helper, socket);
         }
 
@@ -4243,17 +4614,34 @@ impl ResponseCache {
 }
 
 fn package_fingerprint(install_path: &Path) -> Result<String> {
-    let description = file_fingerprint(&install_path.join("DESCRIPTION"))?;
-    let namespace = file_fingerprint(&install_path.join("NAMESPACE"))?;
-    let meta = path_fingerprint(&install_path.join("Meta"))?;
-    let help = path_fingerprint(&install_path.join("help"))?;
-    let doc = path_fingerprint(&install_path.join("doc"))?;
-    let r_dir = path_fingerprint(&install_path.join("R"))?;
+    let mut fingerprint = FingerprintBuilder::new();
+    fingerprint.update(b"rpeek-package-fingerprint-v2\0");
+    fingerprint.update(install_path.as_os_str().as_bytes());
 
-    Ok(format!(
-        "{}|description:{description}|namespace:{namespace}|meta:{meta}|help:{help}|doc:{doc}|r:{r_dir}",
-        install_path.display()
-    ))
+    fingerprint_path(
+        &mut fingerprint,
+        install_path,
+        &install_path.join("DESCRIPTION"),
+        true,
+    )?;
+    fingerprint_path(
+        &mut fingerprint,
+        install_path,
+        &install_path.join("NAMESPACE"),
+        true,
+    )?;
+    for directory in [
+        "Meta", "R", "help", "doc", "html", "libs", "exec", "data", "extdata",
+    ] {
+        fingerprint_path(
+            &mut fingerprint,
+            install_path,
+            &install_path.join(directory),
+            false,
+        )?;
+    }
+
+    Ok(format!("v2:{:016x}", fingerprint.finish()))
 }
 
 fn index_status_response() -> Result<Value> {
@@ -4291,43 +4679,114 @@ fn index_clear_response() -> Result<Value> {
     }))
 }
 
-fn file_fingerprint(path: &Path) -> Result<String> {
-    if !path.exists() {
-        return Ok("missing".to_string());
+struct FingerprintBuilder(u64);
+
+impl FingerprintBuilder {
+    fn new() -> Self {
+        Self(0xcbf29ce484222325)
     }
 
-    let metadata =
-        fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
-    let modified = metadata
-        .modified()
-        .context("failed to read file modification time")?
-        .duration_since(std::time::UNIX_EPOCH)
-        .context("file modification time is before unix epoch")?
-        .as_secs();
+    fn update(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(0x100000001b3);
+        }
+    }
 
-    Ok(format!("{}:{modified}", metadata.len()))
+    fn update_u64(&mut self, value: u64) {
+        self.update(&value.to_le_bytes());
+    }
+
+    fn update_i64(&mut self, value: i64) {
+        self.update(&value.to_le_bytes());
+    }
+
+    fn finish(self) -> u64 {
+        self.0
+    }
 }
 
-fn path_fingerprint(path: &Path) -> Result<String> {
-    if !path.exists() {
-        return Ok("missing".to_string());
+fn fingerprint_path(
+    fingerprint: &mut FingerprintBuilder,
+    root: &Path,
+    path: &Path,
+    hash_file_contents: bool,
+) -> Result<()> {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    fingerprint.update(relative.as_os_str().as_bytes());
+    fingerprint.update(b"\0");
+
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            fingerprint.update(b"missing\0");
+            return Ok(());
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to stat {}", path.display()));
+        }
+    };
+
+    let file_type = metadata.file_type();
+    fingerprint.update(if file_type.is_dir() {
+        b"dir\0"
+    } else if file_type.is_file() {
+        b"file\0"
+    } else if file_type.is_symlink() {
+        b"symlink\0"
+    } else {
+        b"other\0"
+    });
+    fingerprint.update_u64(metadata.dev());
+    fingerprint.update_u64(metadata.ino());
+    fingerprint.update_u64(metadata.len());
+    fingerprint.update_u64(u64::from(metadata.mode()));
+    fingerprint.update_i64(metadata.mtime());
+    fingerprint.update_i64(metadata.mtime_nsec());
+    fingerprint.update_i64(metadata.ctime());
+    fingerprint.update_i64(metadata.ctime_nsec());
+
+    if file_type.is_symlink() {
+        let target = fs::read_link(path)
+            .with_context(|| format!("failed to read symlink {}", path.display()))?;
+        fingerprint.update(target.as_os_str().as_bytes());
+        return Ok(());
     }
 
-    let metadata =
-        fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
-    let modified = metadata
-        .modified()
-        .context("failed to read path modification time")?
-        .duration_since(std::time::UNIX_EPOCH)
-        .context("path modification time is before unix epoch")?
-        .as_secs();
+    if file_type.is_dir() {
+        let mut children = fs::read_dir(path)
+            .with_context(|| format!("failed to read directory {}", path.display()))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        children.sort_by(|left, right| {
+            left.file_name()
+                .as_bytes()
+                .cmp(right.file_name().as_bytes())
+        });
+        for child in children {
+            fingerprint_path(fingerprint, root, &child.path(), false)?;
+        }
+    } else if file_type.is_file() && hash_file_contents {
+        let mut file = fs::File::open(path)
+            .with_context(|| format!("failed to open {} for fingerprinting", path.display()))?;
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let count = file
+                .read(&mut buffer)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            if count == 0 {
+                break;
+            }
+            fingerprint.update(&buffer[..count]);
+        }
+    }
 
-    Ok(modified.to_string())
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn resolve_pkg_topic_accepts_separate_args() {
@@ -4359,5 +4818,38 @@ mod tests {
     fn resolve_pkg_topic_rejects_partial_qualified_form() {
         let err = resolve_pkg_topic("::lm".to_string(), None).unwrap_err();
         assert!(err.to_string().contains("invalid"));
+    }
+
+    #[test]
+    fn package_fingerprint_detects_description_content_change() {
+        let tempdir = TempDir::new().expect("failed to create tempdir");
+        let package = tempdir.path().join("fixture");
+        fs::create_dir_all(package.join("R")).expect("failed to create package tree");
+        fs::write(package.join("DESCRIPTION"), "Version: 1\n").expect("failed to write file");
+        fs::write(package.join("NAMESPACE"), "export(probe)\n").expect("failed to write file");
+        let before = package_fingerprint(&package).expect("failed to fingerprint package");
+
+        fs::write(package.join("DESCRIPTION"), "Version: 2\n").expect("failed to update file");
+        let after = package_fingerprint(&package).expect("failed to fingerprint package");
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn package_fingerprint_detects_replaced_native_library() {
+        let tempdir = TempDir::new().expect("failed to create tempdir");
+        let package = tempdir.path().join("fixture");
+        let libs = package.join("libs");
+        fs::create_dir_all(&libs).expect("failed to create package tree");
+        fs::write(package.join("DESCRIPTION"), "Version: 1\n").expect("failed to write file");
+        fs::write(package.join("NAMESPACE"), "export(probe)\n").expect("failed to write file");
+        let library = libs.join("fixture.so");
+        fs::write(&library, b"old-native-binary").expect("failed to write native library");
+        let before = package_fingerprint(&package).expect("failed to fingerprint package");
+
+        let replacement = libs.join("replacement.so");
+        fs::write(&replacement, b"new-native-binary").expect("failed to write replacement");
+        fs::rename(&replacement, &library).expect("failed to replace native library");
+        let after = package_fingerprint(&package).expect("failed to fingerprint package");
+        assert_ne!(before, after);
     }
 }

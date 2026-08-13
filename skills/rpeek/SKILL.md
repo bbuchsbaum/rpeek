@@ -151,6 +151,14 @@ in only if needed.
   export RPEEK_SOCKET=/tmp/rpeek-session.sock
   ```
 
+- Before reinstalling or removing a package that rpeek has inspected, run
+  `rpeek cache clear --release` (or `rpeek daemon reset-helper`) with the same
+  `RPEEK_SOCKET`. This releases loaded namespaces and compiled libraries while
+  leaving the Rust daemon and persistent index available.
+- The R helper is reaped after an idle interval and restarted automatically
+  when an installed package fingerprint changes. Use `--no-daemon` for a
+  single installation-adjacent query that should not retain package resources.
+
 ## Output and error model
 
 Output is JSON by default. Parse fields directly rather than scraping prose.

@@ -465,7 +465,9 @@ For installed R packages, `deparsed` is often the expected case.
 
 ## Cache and Daemon Reuse
 
-The CLI starts a background daemon on first use and caches successful responses in memory. By default, the socket path is derived from the current executable and temporary directory.
+The CLI starts a background Rust daemon on first use and caches successful responses in memory. The daemon starts its R helper lazily, releases it after 300 seconds without an R-backed request, and starts a fresh helper when it is needed again. Set `RPEEK_HELPER_IDLE_SECS` to change that interval; set it to `0` to disable idle reaping.
+
+The default socket path is stable for the current user. Each daemon records the executable generation that started it, so the next CLI invocation retires and replaces a daemon left behind by an older rpeek binary. rpeek also retires healthy daemons using the previous timestamped default-socket convention.
 
 To force multiple calls to reuse the same warm daemon, set `RPEEK_SOCKET` explicitly:
 
@@ -480,6 +482,7 @@ Useful cache commands:
 ```bash
 target/debug/rpeek cache stats
 target/debug/rpeek cache clear
+target/debug/rpeek cache clear --release
 ```
 
 Inspect, build, search, or clear the persistent index store:
@@ -508,6 +511,7 @@ Inspect, stop, or restart a daemon bound to an explicit socket:
 RPEEK_SOCKET=/tmp/rpeek-demo.sock target/debug/rpeek daemon status
 RPEEK_SOCKET=/tmp/rpeek-demo.sock target/debug/rpeek daemon stop
 RPEEK_SOCKET=/tmp/rpeek-demo.sock target/debug/rpeek daemon restart
+RPEEK_SOCKET=/tmp/rpeek-demo.sock target/debug/rpeek daemon reset-helper
 ```
 
 For a single isolated request without daemon reuse:
@@ -515,6 +519,17 @@ For a single isolated request without daemon reuse:
 ```bash
 target/debug/rpeek --no-daemon summary stats lm
 ```
+
+R namespaces and compiled package libraries remain loaded for the lifetime of the helper. rpeek restarts the helper automatically when an installed package fingerprint changes. Before an installation that must replace or remove currently loaded package files, you can release those resources explicitly without stopping the Rust daemon:
+
+```bash
+rpeek cache clear --release
+# or
+rpeek daemon reset-helper
+R CMD INSTALL ...
+```
+
+Both release commands clear daemon-local response and package state. The persistent SQLite index remains available and will be refreshed when its package fingerprint changes. If `RPEEK_SOCKET` is set, use the same value for the release command and subsequent rpeek calls.
 
 Cache size defaults to 512 successful responses. Override it with `RPEEK_CACHE_ENTRIES`.
 

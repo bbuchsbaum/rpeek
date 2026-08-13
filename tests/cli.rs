@@ -1,7 +1,10 @@
 use rusqlite::Connection;
 use std::fs;
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 struct DaemonGuard {
@@ -31,16 +34,50 @@ fn run(args: &[&str]) -> (i32, String) {
 }
 
 fn run_with_socket(socket: &Path, args: &[&str]) -> (i32, String) {
+    run_with_socket_and_env(socket, args, &[])
+}
+
+fn run_with_socket_and_env(
+    socket: &Path,
+    args: &[&str],
+    extra_env: &[(&str, &Path)],
+) -> (i32, String) {
     let index_path = index_path_for_socket(socket);
-    let output = Command::new(env!("CARGO_BIN_EXE_rpeek"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rpeek"));
+    command
         .args(args)
         .env("RPEEK_SOCKET", socket)
-        .env("RPEEK_INDEX_PATH", &index_path)
-        .output()
-        .expect("failed to run rpeek");
+        .env("RPEEK_INDEX_PATH", &index_path);
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    let output = command.output().expect("failed to run rpeek");
 
     let stdout = String::from_utf8(output.stdout).expect("stdout not utf8");
     (output.status.code().unwrap_or(-1), stdout)
+}
+
+fn wait_for_socket(socket: &Path) {
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(5) {
+        if socket.exists() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!("daemon socket did not appear: {}", socket.display());
+}
+
+fn wait_for_child(child: &mut Child) {
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(5) {
+        if child.try_wait().expect("failed to poll child").is_some() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    let _ = child.kill();
+    panic!("child process did not exit");
 }
 
 fn index_path_for_socket(socket: &Path) -> PathBuf {
@@ -394,7 +431,65 @@ fn daemon_status_reports_running_daemon() {
     assert_eq!(value["command"], "daemon_status");
     assert_eq!(value["payload"]["status"], "running");
     assert!(value["payload"]["pid"].as_u64().is_some());
+    assert!(value["payload"]["generation"].as_str().is_some());
+    assert_eq!(value["payload"]["helper_alive"], false);
+    assert_eq!(value["payload"]["helper"]["starts"], 0);
     assert!(value["payload"]["cache"]["max_entries"].as_u64().is_some());
+}
+
+#[test]
+fn mismatched_daemon_generation_is_retired() {
+    let tempdir = TempDir::new().expect("failed to create tempdir");
+    let socket = tempdir.path().join("rpeek-generation.sock");
+    let index_path = index_path_for_socket(&socket);
+    let _guard = DaemonGuard {
+        socket: socket.clone(),
+    };
+
+    let mut old_daemon = Command::new(env!("CARGO_BIN_EXE_rpeek"))
+        .args([
+            "serve",
+            "--socket",
+            socket.to_str().expect("utf8 socket"),
+            "--generation",
+            "obsolete-test-generation",
+        ])
+        .env("RPEEK_INDEX_PATH", &index_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to start obsolete daemon");
+    let old_pid = old_daemon.id();
+    wait_for_socket(&socket);
+
+    let (code, stdout) = run_with_socket(&socket, &["daemon", "status"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    let new_pid = value["payload"]["pid"]
+        .as_u64()
+        .expect("missing daemon pid") as u32;
+    assert_ne!(new_pid, old_pid);
+    assert_ne!(value["payload"]["generation"], "obsolete-test-generation");
+    wait_for_child(&mut old_daemon);
+}
+
+#[test]
+fn stale_socket_without_daemon_is_recovered() {
+    let tempdir = TempDir::new().expect("failed to create tempdir");
+    let socket = tempdir.path().join("rpeek-stale.sock");
+    let listener = UnixListener::bind(&socket).expect("failed to create stale socket fixture");
+    drop(listener);
+    assert!(socket.exists());
+    let _guard = DaemonGuard {
+        socket: socket.clone(),
+    };
+
+    let (code, stdout) = run_with_socket(&socket, &["daemon", "status"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(value["payload"]["status"], "running");
+    assert!(value["payload"]["generation"].as_str().is_some());
 }
 
 #[test]
@@ -1011,6 +1106,99 @@ fn cache_stats_and_clear_work() {
 }
 
 #[test]
+fn cache_clear_release_stops_helper_but_keeps_daemon() {
+    let tempdir = TempDir::new().expect("failed to create tempdir");
+    let socket = tempdir.path().join("rpeek-cache-release.sock");
+    let _guard = DaemonGuard {
+        socket: socket.clone(),
+    };
+
+    let (code, stdout) = run_with_socket(&socket, &["sig", "stats", "lm"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let (code, stdout) = run_with_socket(&socket, &["daemon", "status"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let before: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    let daemon_pid = before["payload"]["pid"].as_u64().expect("missing pid");
+    assert_eq!(before["payload"]["helper_alive"], true);
+
+    let (code, stdout) = run_with_socket(&socket, &["cache", "clear", "--release"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let released: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(released["payload"]["helper_released"], true);
+
+    let (code, stdout) = run_with_socket(&socket, &["daemon", "status"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let after: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(after["payload"]["pid"], daemon_pid);
+    assert_eq!(after["payload"]["helper_alive"], false);
+    assert_eq!(after["payload"]["helper"]["manual_releases"], 1);
+}
+
+#[test]
+fn daemon_reset_helper_releases_helper_and_cached_state() {
+    let tempdir = TempDir::new().expect("failed to create tempdir");
+    let socket = tempdir.path().join("rpeek-reset-helper.sock");
+    let _guard = DaemonGuard {
+        socket: socket.clone(),
+    };
+
+    let (code, stdout) = run_with_socket(&socket, &["sig", "stats", "lm"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let (code, stdout) = run_with_socket(&socket, &["daemon", "reset-helper"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let reset: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(reset["command"], "helper_reset");
+    assert_eq!(reset["payload"]["status"], "helper_reset");
+    assert_eq!(reset["payload"]["helper_released"], true);
+    assert_eq!(reset["payload"]["cleared_entries"], 1);
+
+    let (code, stdout) = run_with_socket(&socket, &["daemon", "status"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let status: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(status["payload"]["helper_alive"], false);
+    assert_eq!(status["payload"]["cache"]["entries"], 0);
+}
+
+#[test]
+fn idle_helper_is_reaped_without_stopping_daemon() {
+    let tempdir = TempDir::new().expect("failed to create tempdir");
+    let socket = tempdir.path().join("rpeek-idle-helper.sock");
+    let _guard = DaemonGuard {
+        socket: socket.clone(),
+    };
+    let idle_seconds = Path::new("1");
+
+    let (code, stdout) = run_with_socket_and_env(
+        &socket,
+        &["sig", "stats", "lm"],
+        &[("RPEEK_HELPER_IDLE_SECS", idle_seconds)],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let (code, stdout) = run_with_socket(&socket, &["daemon", "status"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let before: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    let daemon_pid = before["payload"]["pid"].as_u64().expect("missing pid");
+    assert_eq!(before["payload"]["helper_alive"], true);
+
+    thread::sleep(Duration::from_millis(1_300));
+    let (code, stdout) = run_with_socket(&socket, &["daemon", "status"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let reaped: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(reaped["payload"]["pid"], daemon_pid);
+    assert_eq!(reaped["payload"]["helper_alive"], false);
+    assert_eq!(reaped["payload"]["helper"]["idle_reaps"], 1);
+
+    let (code, stdout) = run_with_socket(&socket, &["sig", "stats", "glm"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let (code, stdout) = run_with_socket(&socket, &["daemon", "status"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let restarted: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(restarted["payload"]["pid"], daemon_pid);
+    assert_eq!(restarted["payload"]["helper_alive"], true);
+    assert_eq!(restarted["payload"]["helper"]["starts"], 2);
+}
+
+#[test]
 fn search_returns_matches() {
     let (code, stdout) = run(&["search", "stats", "lm"]);
     assert_eq!(code, 0, "stdout: {stdout}");
@@ -1246,4 +1434,88 @@ fn batch_returns_multiple_responses() {
     assert_eq!(responses.len(), 2);
     assert_eq!(responses[0]["command"], "summary");
     assert_eq!(responses[1]["command"], "sig");
+}
+
+fn write_reinstall_fixture(source: &Path, version: &str, marker: &str) {
+    fs::create_dir_all(source.join("R")).expect("failed to create fixture source");
+    fs::write(
+        source.join("DESCRIPTION"),
+        format!(
+            "Package: rpeekfixture\nType: Package\nTitle: rpeek Reinstall Fixture\nVersion: {version}\nAuthors@R: person(\"Test\", \"Author\", email = \"test@example.com\", role = c(\"aut\", \"cre\"))\nDescription: A minimal package used to verify daemon refresh behavior.\nLicense: MIT\nEncoding: UTF-8\n"
+        ),
+    )
+    .expect("failed to write fixture DESCRIPTION");
+    fs::write(source.join("NAMESPACE"), "export(probe)\n")
+        .expect("failed to write fixture NAMESPACE");
+    fs::write(
+        source.join("R").join("probe.R"),
+        format!("probe <- function(marker = \"{marker}\") marker\n"),
+    )
+    .expect("failed to write fixture R source");
+}
+
+fn install_reinstall_fixture(source: &Path, library: &Path) {
+    let output = Command::new("R")
+        .arg("CMD")
+        .arg("INSTALL")
+        .arg(format!("--library={}", library.display()))
+        .arg(source)
+        .output()
+        .expect("failed to run R CMD INSTALL");
+    assert!(
+        output.status.success(),
+        "R CMD INSTALL failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn daemon_restarts_helper_after_installed_package_changes() {
+    let tempdir = TempDir::new().expect("failed to create tempdir");
+    let source = tempdir.path().join("rpeekfixture");
+    let library = tempdir.path().join("library");
+    let socket = tempdir.path().join("rpeek-reinstall.sock");
+    fs::create_dir_all(&library).expect("failed to create fixture library");
+    let _guard = DaemonGuard {
+        socket: socket.clone(),
+    };
+
+    write_reinstall_fixture(&source, "0.0.1", "v1");
+    install_reinstall_fixture(&source, &library);
+    let (code, stdout) = run_with_socket_and_env(
+        &socket,
+        &["sig", "rpeekfixture", "probe"],
+        &[("R_LIBS_USER", &library)],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let first: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert!(
+        first["payload"]["signature"]
+            .as_str()
+            .expect("missing signature")
+            .contains("v1")
+    );
+
+    write_reinstall_fixture(&source, "0.0.2", "v2");
+    install_reinstall_fixture(&source, &library);
+
+    let (code, stdout) = run_with_socket_and_env(
+        &socket,
+        &["sig", "rpeekfixture", "probe"],
+        &[("R_LIBS_USER", &library)],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let second: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    let signature = second["payload"]["signature"]
+        .as_str()
+        .expect("missing signature");
+    assert!(signature.contains("v2"), "stale signature: {signature}");
+    assert!(!signature.contains("v1"), "stale signature: {signature}");
+
+    let (code, stdout) = run_with_socket(&socket, &["daemon", "status"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let status: serde_json::Value = serde_json::from_str(&stdout).expect("invalid json");
+    assert_eq!(status["payload"]["cache"]["invalidations"], 1);
+    assert_eq!(status["payload"]["helper"]["restarts"], 1);
 }

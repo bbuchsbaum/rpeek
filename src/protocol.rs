@@ -201,6 +201,8 @@ pub enum Request {
     CacheStats,
     /// Return daemon status and helper/cache health.
     DaemonStatus,
+    /// Release the R helper and clear daemon-local state without stopping the daemon.
+    HelperReset,
     /// Stop the daemon.
     Shutdown,
 }
@@ -233,6 +235,7 @@ impl Request {
             Self::CacheClear => "cache_clear",
             Self::CacheStats => "cache_stats",
             Self::DaemonStatus => "daemon_status",
+            Self::HelperReset => "helper_reset",
             Self::Shutdown => "shutdown",
         }
     }
@@ -271,6 +274,7 @@ impl Request {
                 | Self::CacheClear
                 | Self::CacheStats
                 | Self::DaemonStatus
+                | Self::HelperReset
                 | Self::Shutdown
         )
     }
@@ -285,6 +289,7 @@ impl Request {
                 | Self::CacheClear
                 | Self::CacheStats
                 | Self::DaemonStatus
+                | Self::HelperReset
                 | Self::Shutdown
         )
     }
@@ -298,6 +303,7 @@ impl Request {
                 | Self::CacheClear
                 | Self::CacheStats
                 | Self::DaemonStatus
+                | Self::HelperReset
                 | Self::Fingerprint { .. }
                 | Self::SearchAll { .. }
                 | Self::Resolve { package: None, .. }
@@ -369,5 +375,16 @@ mod tests {
         assert_eq!(request.package(), Some("stats"));
         assert!(request.requires_package());
         assert!(request.is_cacheable());
+    }
+
+    #[test]
+    fn cache_clear_wire_shape_remains_backward_compatible() {
+        let request: Request = serde_json::from_str(r#"{"action":"cache_clear"}"#)
+            .expect("cache_clear should deserialize");
+        assert_eq!(request, Request::CacheClear);
+        assert_eq!(
+            serde_json::to_string(&request).expect("cache_clear should serialize"),
+            r#"{"action":"cache_clear"}"#
+        );
     }
 }
